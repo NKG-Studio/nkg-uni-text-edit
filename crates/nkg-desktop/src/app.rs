@@ -678,6 +678,7 @@ pub struct NkgApp {
     path_input: String,
     global_message: String,
     search_focus_requested: bool,
+    title_bar_icon: egui::TextureHandle,
 }
 
 impl NkgApp {
@@ -688,6 +689,17 @@ impl NkgApp {
         initial_search: Option<String>,
     ) -> Self {
         theme::configure(&context.egui_ctx);
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/nkg-icon.png"))
+            .expect("embedded application icon must be a valid PNG");
+        let icon_image = egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        );
+        let title_bar_icon = context.egui_ctx.load_texture(
+            "nkg-title-bar-icon",
+            icon_image,
+            egui::TextureOptions::LINEAR,
+        );
         let mut app = Self {
             tabs: Vec::new(),
             diff: None,
@@ -696,6 +708,7 @@ impl NkgApp {
             path_input: String::new(),
             global_message: "就绪".into(),
             search_focus_requested: false,
+            title_bar_icon,
         };
         if let Some(path) = initial_path {
             app.path_input = path.display().to_string();
@@ -796,25 +809,105 @@ impl NkgApp {
     }
 
     fn show_top_bar(&mut self, root: &mut egui::Ui) {
+        let maximized = root
+            .ctx()
+            .input(|input| input.viewport().maximized.unwrap_or(false));
         egui::Panel::top("title_bar")
-            .exact_size(38.0)
-            .frame(egui::Frame::NONE.fill(theme::PANEL))
+            .exact_size(40.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
             .show(root, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if ui.button("打开  Ctrl+O").clicked() {
-                        self.open_dialog();
-                    }
-                    let response = ui.add_sized(
-                        [ui.available_width() - 190.0, 26.0],
-                        egui::TextEdit::singleline(&mut self.path_input)
-                            .hint_text("输入文件路径后按 Enter")
-                            .font(TextStyle::Monospace),
-                    );
-                    if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                        self.open_path(PathBuf::from(self.path_input.trim()));
-                    }
-                    ui.label(RichText::new("只读").color(theme::MUTED));
-                });
+                let title_bar_rect = ui.available_rect_before_wrap();
+                let controls_width = 3.0 * 46.0;
+                let content_rect = egui::Rect::from_min_max(
+                    title_bar_rect.min,
+                    egui::pos2(title_bar_rect.max.x - controls_width, title_bar_rect.max.y),
+                );
+                let controls_rect = egui::Rect::from_min_max(
+                    egui::pos2(title_bar_rect.max.x - controls_width, title_bar_rect.min.y),
+                    title_bar_rect.max,
+                );
+
+                let mut content_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("title_bar_content")
+                        .max_rect(content_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                let (drag_rect, drag_response) = content_ui
+                    .allocate_exact_size(egui::vec2(190.0, 40.0), Sense::click_and_drag());
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::pos2(drag_rect.left() + 22.0, drag_rect.center().y),
+                    egui::vec2(24.0, 24.0),
+                );
+                content_ui.painter().image(
+                    self.title_bar_icon.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                content_ui.painter().text(
+                    egui::pos2(icon_rect.right() + 8.0, drag_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "NKG Uni Text Edit",
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(230, 230, 230),
+                );
+                let drag_response = drag_response.on_hover_cursor(egui::CursorIcon::Grab);
+                if drag_response.double_clicked() {
+                    content_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if drag_response.drag_started_by(egui::PointerButton::Primary) {
+                    content_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if content_ui.button("打开  Ctrl+O").clicked() {
+                    self.open_dialog();
+                }
+                let path_width = (content_rect.width() - 355.0).max(180.0);
+                let response = content_ui.add_sized(
+                    [path_width, 26.0],
+                    egui::TextEdit::singleline(&mut self.path_input)
+                        .hint_text("输入文件路径后按 Enter")
+                        .font(TextStyle::Monospace),
+                );
+                if response.lost_focus() && content_ui.input(|input| input.key_pressed(Key::Enter))
+                {
+                    self.open_path(PathBuf::from(self.path_input.trim()));
+                }
+                content_ui.label(RichText::new("只读").color(theme::MUTED));
+
+                let mut controls_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("window_controls")
+                        .max_rect(controls_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                if window_control_button(&mut controls_ui, WindowControl::Minimize).clicked() {
+                    controls_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                let maximize_control = if maximized {
+                    WindowControl::Restore
+                } else {
+                    WindowControl::Maximize
+                };
+                if window_control_button(&mut controls_ui, maximize_control).clicked() {
+                    controls_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if window_control_button(&mut controls_ui, WindowControl::Close).clicked() {
+                    controls_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
     }
 
@@ -1428,8 +1521,173 @@ impl eframe::App for NkgApp {
         self.show_file_overview(root);
         self.show_editor(root);
         self.show_file_drop_overlay(&context);
+        show_window_resize_handles(root);
         context.request_repaint_after(Duration::from_millis(200));
     }
+}
+
+#[derive(Clone, Copy)]
+enum WindowControl {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+fn window_control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, 40.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let background = if matches!(control, WindowControl::Close) {
+            Color32::from_rgb(196, 43, 28)
+        } else {
+            Color32::from_rgb(62, 62, 64)
+        };
+        ui.painter().rect_filled(rect, 0.0, background);
+    }
+
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.2, Color32::from_rgb(230, 230, 230));
+    match control {
+        WindowControl::Minimize => {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x - 5.0, center.y + 3.0),
+                    egui::pos2(center.x + 5.0, center.y + 3.0),
+                ],
+                stroke,
+            );
+        }
+        WindowControl::Maximize => {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        WindowControl::Restore => {
+            let back =
+                egui::Rect::from_center_size(center + egui::vec2(2.0, -2.0), egui::vec2(9.0, 9.0));
+            let front =
+                egui::Rect::from_center_size(center + egui::vec2(-2.0, 2.0), egui::vec2(9.0, 9.0));
+            ui.painter()
+                .rect_stroke(back, 0.0, stroke, egui::StrokeKind::Inside);
+            ui.painter().rect_filled(front, 0.0, theme::PANEL);
+            ui.painter()
+                .rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
+        }
+        WindowControl::Close => {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x - 4.5, center.y - 4.5),
+                    egui::pos2(center.x + 4.5, center.y + 4.5),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x + 4.5, center.y - 4.5),
+                    egui::pos2(center.x - 4.5, center.y + 4.5),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    response.on_hover_text(match control {
+        WindowControl::Minimize => "最小化",
+        WindowControl::Maximize => "最大化",
+        WindowControl::Restore => "还原",
+        WindowControl::Close => "关闭",
+    })
+}
+
+fn show_window_resize_handles(root: &egui::Ui) {
+    let context = root.ctx();
+    let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+    if maximized {
+        return;
+    }
+
+    const EDGE: f32 = 5.0;
+    const CORNER: f32 = 10.0;
+    let rect = context.content_rect();
+    let min = rect.min;
+    let max = rect.max;
+    let handles = [
+        (
+            egui::Rect::from_min_max(min, egui::pos2(max.x, min.y + EDGE)),
+            egui::ResizeDirection::North,
+            egui::CursorIcon::ResizeNorth,
+        ),
+        (
+            egui::Rect::from_min_max(egui::pos2(min.x, max.y - EDGE), egui::pos2(max.x, max.y)),
+            egui::ResizeDirection::South,
+            egui::CursorIcon::ResizeSouth,
+        ),
+        (
+            egui::Rect::from_min_max(min, egui::pos2(min.x + EDGE, max.y)),
+            egui::ResizeDirection::West,
+            egui::CursorIcon::ResizeWest,
+        ),
+        (
+            egui::Rect::from_min_max(egui::pos2(max.x - EDGE, min.y), egui::pos2(max.x, max.y)),
+            egui::ResizeDirection::East,
+            egui::CursorIcon::ResizeEast,
+        ),
+        (
+            egui::Rect::from_min_max(min, min + egui::vec2(CORNER, CORNER)),
+            egui::ResizeDirection::NorthWest,
+            egui::CursorIcon::ResizeNorthWest,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(max.x - CORNER, min.y),
+                egui::pos2(max.x, min.y + CORNER),
+            ),
+            egui::ResizeDirection::NorthEast,
+            egui::CursorIcon::ResizeNorthEast,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(min.x, max.y - CORNER),
+                egui::pos2(min.x + CORNER, max.y),
+            ),
+            egui::ResizeDirection::SouthWest,
+            egui::CursorIcon::ResizeSouthWest,
+        ),
+        (
+            egui::Rect::from_min_max(max - egui::vec2(CORNER, CORNER), max),
+            egui::ResizeDirection::SouthEast,
+            egui::CursorIcon::ResizeSouthEast,
+        ),
+    ];
+
+    for (index, (handle, direction, cursor)) in handles.into_iter().enumerate() {
+        let response = root
+            .interact(
+                handle,
+                root.id().with(("window_resize_handle", index)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(cursor);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    context
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("window_border"),
+        ))
+        .rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
 }
 
 fn read_window(document: &TextDocument, offset: u64) -> Result<TextWindow, String> {
