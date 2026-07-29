@@ -19,9 +19,12 @@ fn main() -> eframe::Result {
         } else {
             (second_argument.map(std::path::PathBuf::from), None)
         };
+    let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/nkg-icon.png"))
+        .expect("embedded application icon must be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NKG Uni Text Edit")
+            .with_icon(app_icon)
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 560.0]),
         centered: true,

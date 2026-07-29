@@ -14,5 +14,8 @@ eframe.workspace = true
 nkg-text-engine = { path = "../text-engine" }
 rfd.workspace = true
 
+[build-dependencies]
+embed-resource = "3.0.11"
+
 [dev-dependencies]
 tempfile.workspace = true
