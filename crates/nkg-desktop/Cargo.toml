@@ -1,0 +1,18 @@
+[package]
+name = "nkg-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nkg-text-viewer"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+nkg-text-engine = { path = "../text-engine" }
+rfd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

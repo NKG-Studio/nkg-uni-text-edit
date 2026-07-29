@@ -1,0 +1,17 @@
+[package]
+name = "nkg-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nkg-text"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nkg-text-engine = { path = "../text-engine" }
+serde_json.workspace = true
+
