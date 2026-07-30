@@ -2,6 +2,7 @@ use crate::theme;
 use eframe::egui::{
     self, Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextFormat, TextStyle,
     containers::scroll_area::ScrollBarVisibility, text::LayoutJob,
+    text_selection::LabelSelectionState,
 };
 use nkg_text_engine::{
     BlockDiffKind, BlockDiffOptions, BlockDiffRun, BlockDiffSummary, CaseSensitivity,
@@ -29,7 +30,67 @@ const MAX_DISPLAY_LINE_BYTES: usize = 32 * 1024;
 const VISIBLE_HIGHLIGHT_LIMIT: usize = 10_000;
 const SEARCH_PREVIEW_CACHE_LIMIT: usize = 2_000;
 const SEARCH_PREVIEW_BYTES: usize = 64 * 1024;
+const TITLE_BAR_CONTROL_HEIGHT: f32 = 26.0;
+const TAB_BAR_HEIGHT: f32 = 36.0;
+const TAB_HORIZONTAL_PADDING: f32 = 10.0;
+const TAB_LABEL_HORIZONTAL_PADDING: f32 = 4.0;
+const TAB_LABEL_HEIGHT: f32 = 24.0;
+const TAB_CLOSE_SIZE: f32 = 20.0;
+const TAB_CONTENT_GAP: f32 = 6.0;
 const SEARCH_RESULT_ROW_HEIGHT: f32 = 22.0;
+const SEARCH_COMPARISON_ROW_HEIGHT: f32 = 42.0;
+const SEARCH_COMPARISON_HEADER_HEIGHT: f32 = 48.0;
+const SEARCH_COMPARISON_DIVIDER_WIDTH: f32 = 1.0;
+const HORIZONTAL_SCROLLBAR_HEIGHT: f32 = 14.0;
+const MIN_SCROLLBAR_THUMB_WIDTH: f32 = 28.0;
+const EDITOR_GUTTER_WIDTH: f32 = 76.0;
+const SEARCH_RESULT_INDEX_WIDTH: f32 = 78.0;
+const SEARCH_RESULT_LINE_WIDTH: f32 = 112.0;
+const MIN_FILE_OVERVIEW_THUMB_HEIGHT: f32 = 28.0;
+const MAX_FILE_OVERVIEW_THUMB_HEIGHT: f32 = 120.0;
+
+fn file_overview_thumb_height(track_height: f32, visible_lines: u64, total_lines: u64) -> f32 {
+    let track_height = track_height.max(0.0);
+    let minimum = MIN_FILE_OVERVIEW_THUMB_HEIGHT.min(track_height);
+    let maximum = MAX_FILE_OVERVIEW_THUMB_HEIGHT.min(track_height);
+    let visible_fraction = if total_lines == 0 {
+        1.0
+    } else {
+        (visible_lines.max(1) as f32 / total_lines as f32).clamp(0.0, 1.0)
+    };
+    (track_height * visible_fraction).clamp(minimum, maximum)
+}
+
+fn estimate_total_lines(file_len: u64, window: &TextWindow) -> u64 {
+    let sampled_lines = window.lines.len().max(1) as u64;
+    if file_len == 0 || (window.start_offset == 0 && window.reached_end) {
+        return sampled_lines;
+    }
+
+    let sampled_bytes = window
+        .next_offset
+        .saturating_sub(window.start_offset)
+        .max(1);
+    let estimate = (file_len as u128 * sampled_lines as u128)
+        .div_ceil(sampled_bytes as u128)
+        .min(u64::MAX as u128);
+    estimate as u64
+}
+
+fn editor_max_scroll_offset(content_height: f32, viewport_height: f32) -> f32 {
+    (content_height - viewport_height).max(0.0)
+}
+
+fn editor_scroll_is_at_bottom(offset: f32, maximum_offset: f32) -> bool {
+    maximum_offset <= f32::EPSILON || offset >= maximum_offset - 1.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SelectionSurface {
+    #[default]
+    Editor,
+    SearchResults,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarMode {
@@ -76,6 +137,50 @@ struct SearchSession {
     error: Option<String>,
     expanded: bool,
     preview_cache: HashMap<u64, SearchPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchSessionKey {
+    path: PathBuf,
+    session_id: u64,
+}
+
+#[derive(Clone)]
+struct SearchComparisonSource {
+    key: SearchSessionKey,
+    document: Arc<TextDocument>,
+    query: String,
+    store: Arc<SearchHitStore>,
+}
+
+#[derive(Clone)]
+struct SearchComparison {
+    left: SearchComparisonSource,
+    right: SearchComparisonSource,
+}
+
+enum SearchComparisonChoice {
+    AwaitingRight,
+    Cancelled,
+    Ready(SearchComparison),
+}
+
+fn update_search_comparison_choice(
+    pending_left: &mut Option<SearchComparisonSource>,
+    source: SearchComparisonSource,
+) -> SearchComparisonChoice {
+    let Some(left) = pending_left.take() else {
+        *pending_left = Some(source);
+        return SearchComparisonChoice::AwaitingRight;
+    };
+    if left.key == source.key {
+        SearchComparisonChoice::Cancelled
+    } else {
+        SearchComparisonChoice::Ready(SearchComparison {
+            left,
+            right: source,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -128,13 +233,23 @@ struct DocumentView {
     editor_scroll_offset: Option<f32>,
     editor_scroll_revision: u64,
     editor_stick_to_bottom: bool,
+    editor_horizontal_offset: f32,
+    editor_horizontal_drag_offset: Option<f32>,
+    editor_visible_line_capacity: u64,
+    overview_estimated_total_lines: u64,
     overview_drag_offset: Option<f32>,
+    selection_surface: SelectionSurface,
+    selected_editor_line: Option<u64>,
+    editor_select_all: bool,
+    selected_search_hit: Option<(u64, u64)>,
+    search_select_all: bool,
 }
 
 impl DocumentView {
     fn open(path: PathBuf) -> Result<Self, String> {
         let document = TextDocument::open(&path).map_err(|error| error.to_string())?;
         let window = read_window(&document, 0)?;
+        let overview_estimated_total_lines = estimate_total_lines(document.len(), &window);
         document.start_background_index();
         Ok(Self {
             path,
@@ -155,7 +270,16 @@ impl DocumentView {
             editor_scroll_offset: Some(0.0),
             editor_scroll_revision: 0,
             editor_stick_to_bottom: false,
+            editor_horizontal_offset: 0.0,
+            editor_horizontal_drag_offset: None,
+            editor_visible_line_capacity: 0,
+            overview_estimated_total_lines,
             overview_drag_offset: None,
+            selection_surface: SelectionSurface::Editor,
+            selected_editor_line: None,
+            editor_select_all: false,
+            selected_search_hit: None,
+            search_select_all: false,
         })
     }
 
@@ -175,6 +299,8 @@ impl DocumentView {
                 self.editor_scroll_offset = Some(0.0);
                 self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
                 self.editor_stick_to_bottom = false;
+                self.editor_horizontal_offset = 0.0;
+                self.editor_horizontal_drag_offset = None;
                 self.refresh_highlights();
                 self.status_message = "已跳转".into();
             }
@@ -209,6 +335,8 @@ impl DocumentView {
                 self.editor_scroll_offset = None;
                 self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
                 self.editor_stick_to_bottom = true;
+                self.editor_horizontal_offset = 0.0;
+                self.editor_horizontal_drag_offset = None;
                 self.refresh_highlights();
                 self.status_message = "已到达文件末尾".into();
             }
@@ -281,6 +409,45 @@ impl DocumentView {
             VISIBLE_HIGHLIGHT_LIMIT,
         )
         .unwrap_or_default();
+    }
+
+    fn select_all(&mut self) {
+        match self.selection_surface {
+            SelectionSurface::Editor => {
+                self.selected_editor_line = None;
+                self.editor_select_all = true;
+                self.status_message = "已全选正文".into();
+            }
+            SelectionSurface::SearchResults => {
+                self.selected_search_hit = None;
+                self.search_select_all = true;
+                self.status_message = "已全选搜索结果".into();
+            }
+        }
+    }
+
+    fn select_editor_line(&mut self, byte_start: u64) {
+        self.selection_surface = SelectionSurface::Editor;
+        self.selected_editor_line = Some(byte_start);
+        self.editor_select_all = false;
+    }
+
+    fn begin_editor_text_selection(&mut self) {
+        self.selection_surface = SelectionSurface::Editor;
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
+    }
+
+    fn select_search_hit(&mut self, session_id: u64, hit_index: u64) {
+        self.selection_surface = SelectionSurface::SearchResults;
+        self.selected_search_hit = Some((session_id, hit_index));
+        self.search_select_all = false;
+    }
+
+    fn begin_search_text_selection(&mut self) {
+        self.selection_surface = SelectionSurface::SearchResults;
+        self.selected_search_hit = None;
+        self.search_select_all = false;
     }
 
     fn start_search(&mut self, context: &egui::Context) {
@@ -673,6 +840,8 @@ impl Drop for DiffView {
 pub struct NkgApp {
     tabs: Vec<DocumentView>,
     diff: Option<DiffView>,
+    search_comparison_left: Option<SearchComparisonSource>,
+    search_comparison: Option<SearchComparison>,
     active_tab: usize,
     sidebar_mode: SidebarMode,
     path_input: String,
@@ -703,6 +872,8 @@ impl NkgApp {
         let mut app = Self {
             tabs: Vec::new(),
             diff: None,
+            search_comparison_left: None,
+            search_comparison: None,
             active_tab: 0,
             sidebar_mode: SidebarMode::Explorer,
             path_input: String::new(),
@@ -798,6 +969,38 @@ impl NkgApp {
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
     }
 
+    fn choose_search_comparison_source(&mut self, source: SearchComparisonSource) {
+        let label = search_comparison_source_label(&source);
+        match update_search_comparison_choice(&mut self.search_comparison_left, source) {
+            SearchComparisonChoice::AwaitingRight => {
+                if let Some(tab) = self.active_mut() {
+                    tab.status_message = format!("已选择左侧搜索结果：{label}，请选择另一组结果");
+                }
+            }
+            SearchComparisonChoice::Cancelled => {
+                if let Some(tab) = self.active_mut() {
+                    tab.status_message = "已取消搜索结果对比选择".into();
+                }
+            }
+            SearchComparisonChoice::Ready(comparison) => {
+                self.search_comparison = Some(comparison);
+                self.sidebar_mode = SidebarMode::Search;
+                if let Some(tab) = self.active_mut() {
+                    tab.status_message = "已打开搜索结果对比".into();
+                }
+            }
+        }
+    }
+
+    fn jump_to_comparison_hit(&mut self, source: &SearchComparisonSource, hit: SearchHit) {
+        self.open_path(source.key.path.clone());
+        if let Some(tab) = self.active_mut() {
+            tab.query = source.query.clone();
+            tab.refresh_highlights();
+            tab.jump_to_hit(hit);
+        }
+    }
+
     fn keyboard_shortcuts(&mut self, context: &egui::Context) {
         if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::O)) {
             self.open_dialog();
@@ -805,6 +1008,15 @@ impl NkgApp {
         if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::F)) {
             self.sidebar_mode = SidebarMode::Search;
             self.search_focus_requested = true;
+        }
+        let select_all = !context.egui_wants_keyboard_input()
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::A));
+        if select_all && let Some(tab) = self.active_mut() {
+            tab.select_all();
+            context
+                .plugin::<LabelSelectionState>()
+                .lock()
+                .clear_selection();
         }
     }
 
@@ -866,16 +1078,31 @@ impl NkgApp {
                         .ctx()
                         .send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                if content_ui.button("打开  Ctrl+O").clicked() {
+                if content_ui
+                    .add(
+                        egui::Button::new("打开  Ctrl+O")
+                            .min_size(egui::vec2(0.0, TITLE_BAR_CONTROL_HEIGHT)),
+                    )
+                    .clicked()
+                {
                     self.open_dialog();
                 }
                 let path_width = (content_rect.width() - 355.0).max(180.0);
                 let response = content_ui.add_sized(
-                    [path_width, 26.0],
+                    [path_width, TITLE_BAR_CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.path_input)
-                        .hint_text("输入文件路径后按 Enter")
-                        .font(TextStyle::Monospace),
+                        .font(TextStyle::Monospace)
+                        .vertical_align(Align::Center),
                 );
+                if self.path_input.is_empty() {
+                    content_ui.painter().text(
+                        egui::pos2(response.rect.left() + 4.0, response.rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "输入文件路径后按 Enter",
+                        TextStyle::Monospace.resolve(content_ui.style()),
+                        content_ui.visuals().weak_text_color(),
+                    );
+                }
                 if response.lost_focus() && content_ui.input(|input| input.key_pressed(Key::Enter))
                 {
                     self.open_path(PathBuf::from(self.path_input.trim()));
@@ -1182,37 +1409,110 @@ impl NkgApp {
     }
 
     fn show_tabs(&mut self, ui: &mut egui::Ui) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let mut close = None;
         let mut select = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (index, tab) in self.tabs.iter().enumerate() {
-                let selected = index == self.active_tab;
-                let fill = if selected {
-                    theme::BACKGROUND
-                } else {
-                    theme::PANEL
-                };
-                egui::Frame::NONE
-                    .fill(fill)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .inner_margin(egui::Margin::symmetric(10, 5))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(selected, tab.name())
-                                .on_hover_text(tab.path.display().to_string())
-                                .clicked()
-                            {
-                                select = Some(index);
-                            }
-                            if ui.small_button("×").clicked() {
-                                close = Some(index);
-                            }
-                        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), TAB_BAR_HEIGHT),
+            Layout::left_to_right(Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (index, tab) in self.tabs.iter().enumerate() {
+                    let selected = index == self.active_tab;
+                    let name = tab.name();
+                    let path = tab.path.display().to_string();
+                    let font_id = TextStyle::Button.resolve(ui.style());
+                    let text_color = if selected {
+                        theme::TEXT_ON_SELECTION
+                    } else {
+                        ui.visuals().widgets.inactive.fg_stroke.color
+                    };
+                    let text_width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(name.clone(), font_id.clone(), text_color)
+                            .size()
+                            .x
                     });
-            }
-        });
+                    let label_width = text_width + TAB_LABEL_HORIZONTAL_PADDING * 2.0;
+                    let tab_width = TAB_HORIZONTAL_PADDING * 2.0
+                        + label_width
+                        + TAB_CONTENT_GAP
+                        + TAB_CLOSE_SIZE;
+                    let (tab_rect, tab_response) = ui
+                        .allocate_exact_size(egui::vec2(tab_width, TAB_BAR_HEIGHT), Sense::click());
+                    let tab_response = tab_response.on_hover_text(path);
+                    let fill = if selected {
+                        theme::BACKGROUND
+                    } else {
+                        theme::PANEL
+                    };
+                    ui.painter().rect_filled(tab_rect, 0.0, fill);
+                    ui.painter().rect_stroke(
+                        tab_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, theme::BORDER),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    let label_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            tab_rect.left() + TAB_HORIZONTAL_PADDING + label_width * 0.5,
+                            tab_rect.center().y,
+                        ),
+                        egui::vec2(label_width, TAB_LABEL_HEIGHT),
+                    );
+                    if selected {
+                        ui.painter().rect_filled(label_rect, 2.0, theme::SELECTION);
+                    }
+                    ui.painter().text(
+                        egui::pos2(
+                            label_rect.left() + TAB_LABEL_HORIZONTAL_PADDING,
+                            tab_rect.center().y,
+                        ),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        font_id,
+                        text_color,
+                    );
+
+                    let close_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            tab_rect.right() - TAB_HORIZONTAL_PADDING - TAB_CLOSE_SIZE * 0.5,
+                            tab_rect.center().y,
+                        ),
+                        egui::vec2(TAB_CLOSE_SIZE, TAB_CLOSE_SIZE),
+                    );
+                    let close_id = ui.make_persistent_id(("tab_close", index, &tab.path));
+                    let close_response = ui.interact(close_rect, close_id, Sense::click());
+                    if close_response.hovered() {
+                        ui.painter().rect_filled(
+                            close_rect,
+                            2.0,
+                            ui.visuals().widgets.hovered.weak_bg_fill,
+                        );
+                    }
+                    ui.painter().text(
+                        close_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        FontId::proportional(13.0),
+                        if close_response.hovered() {
+                            theme::TEXT
+                        } else {
+                            theme::MUTED
+                        },
+                    );
+
+                    if close_response.clicked() {
+                        close = Some(index);
+                    } else if tab_response.clicked() {
+                        select = Some(index);
+                    }
+                }
+            },
+        );
         if let Some(index) = select {
             self.active_tab = index;
             self.path_input = self.tabs[index].path.display().to_string();
@@ -1223,12 +1523,17 @@ impl NkgApp {
     }
 
     fn show_search_results_panel(&mut self, root: &mut egui::Ui) {
-        let should_show = self
-            .active()
-            .is_some_and(|tab| tab.search_results_open && !tab.search_sessions.is_empty());
+        let should_show = self.search_comparison.is_some()
+            || self
+                .active()
+                .is_some_and(|tab| tab.search_results_open && !tab.search_sessions.is_empty());
         if !should_show || self.sidebar_mode == SidebarMode::Compare {
             return;
         }
+        let comparison = self.search_comparison.clone();
+        let compare_left = self.search_comparison_left.clone();
+        let mut comparison_action = SearchComparisonAction::default();
+        let mut chosen_source = None;
         egui::Panel::bottom("search_results_panel")
             .default_size(280.0)
             .size_range(130.0..=620.0)
@@ -1239,10 +1544,32 @@ impl NkgApp {
                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
             .show(root, |ui| {
-                if let Some(tab) = self.active_mut() {
-                    show_search_results(ui, tab);
+                if let Some(comparison) = &comparison {
+                    comparison_action = show_search_comparison(ui, comparison);
+                } else if let Some(tab) = self.active_mut() {
+                    chosen_source = show_search_results(ui, tab, compare_left.as_ref());
                 }
             });
+
+        if let Some(source) = chosen_source {
+            self.choose_search_comparison_source(source);
+        }
+        if comparison_action.close {
+            self.search_comparison = None;
+        } else if comparison_action.swap
+            && let Some(comparison) = &mut self.search_comparison
+        {
+            std::mem::swap(&mut comparison.left, &mut comparison.right);
+        }
+        if let Some((side, hit)) = comparison_action.jump
+            && let Some(comparison) = comparison
+        {
+            let source = match side {
+                SearchComparisonSide::Left => &comparison.left,
+                SearchComparisonSide::Right => &comparison.right,
+            };
+            self.jump_to_comparison_hit(source, hit);
+        }
     }
 
     fn show_file_overview(&mut self, root: &mut egui::Ui) {
@@ -1272,18 +1599,21 @@ impl NkgApp {
                     (tab.requested_offset as f64 / file_len as f64).clamp(0.0, 1.0)
                 };
 
-                let visible_bytes = tab
-                    .window
-                    .next_offset
-                    .saturating_sub(tab.window.start_offset);
-                let visible_fraction = if file_len == 0 {
-                    1.0
+                let row_height = ui.text_style_height(&TextStyle::Monospace) + 4.0;
+                let visible_lines = if tab.editor_visible_line_capacity == 0 {
+                    ((track.height() - HORIZONTAL_SCROLLBAR_HEIGHT).max(row_height) / row_height)
+                        .floor()
+                        .max(1.0) as u64
                 } else {
-                    visible_bytes as f32 / file_len as f32
+                    tab.editor_visible_line_capacity
                 };
-                let thumb_height = (track.height() * visible_fraction)
-                    .clamp(28.0, track.height().max(28.0))
-                    .min(track.height());
+                let total_lines = tab
+                    .document
+                    .index_status()
+                    .total_lines
+                    .unwrap_or(tab.overview_estimated_total_lines);
+                let thumb_height =
+                    file_overview_thumb_height(track.height(), visible_lines, total_lines);
                 let travel = (track.height() - thumb_height).max(0.0);
                 let initial_thumb_top = track.top() + travel * ratio as f32;
                 let initial_thumb = egui::Rect::from_min_size(
@@ -1464,6 +1794,7 @@ impl NkgApp {
             .exact_size(24.0)
             .frame(egui::Frame::NONE.fill(theme::STATUS))
             .show(root, |ui| {
+                ui.visuals_mut().override_text_color = Some(theme::TEXT_ON_SELECTION);
                 ui.horizontal_centered(|ui| {
                     if self.sidebar_mode == SidebarMode::Compare
                         && let Some(diff) = &self.diff
@@ -1865,7 +2196,7 @@ fn show_diff_cell(
                         egui::Label::new(
                             RichText::new(&line.text[..end])
                                 .monospace()
-                                .color(Color32::from_rgb(212, 212, 212)),
+                                .color(theme::TEXT),
                         )
                         .truncate()
                         .selectable(true),
@@ -1877,7 +2208,348 @@ fn show_diff_cell(
         });
 }
 
-fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchComparisonSide {
+    Left,
+    Right,
+}
+
+#[derive(Default)]
+struct SearchComparisonAction {
+    close: bool,
+    swap: bool,
+    jump: Option<(SearchComparisonSide, SearchHit)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchComparisonRowKind {
+    Equal,
+    Different,
+    LeftOnly,
+    RightOnly,
+}
+
+fn show_search_comparison(
+    ui: &mut egui::Ui,
+    comparison: &SearchComparison,
+) -> SearchComparisonAction {
+    let mut action = SearchComparisonAction::default();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("搜索结果对比").strong());
+        ui.label(
+            RichText::new("按结果序号逐项对比")
+                .small()
+                .color(theme::MUTED),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .small_button("×")
+                .on_hover_text("关闭搜索结果对比")
+                .clicked()
+            {
+                action.close = true;
+            }
+            if ui
+                .small_button("交换")
+                .on_hover_text("交换左右结果")
+                .clicked()
+            {
+                action.swap = true;
+            }
+        });
+    });
+    if action.close {
+        return action;
+    }
+
+    let left_count = comparison.left.store.hit_count();
+    let right_count = comparison.right.store.hit_count();
+    show_search_comparison_headers(ui, comparison, left_count, right_count);
+
+    let total_rows_u64 = left_count.max(right_count);
+    let total_rows = usize::try_from(total_rows_u64).unwrap_or(usize::MAX);
+    let mut read_error = None;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ScrollArea::vertical()
+        .id_salt((
+            "search_comparison",
+            &comparison.left.key,
+            &comparison.right.key,
+        ))
+        .auto_shrink([false, false])
+        .show_rows(
+            ui,
+            SEARCH_COMPARISON_ROW_HEIGHT,
+            total_rows,
+            |ui, visible| {
+                let start = visible.start as u64;
+                let count = visible.len();
+                let left_hits = match comparison.left.store.read_page(start, count) {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        Vec::new()
+                    }
+                };
+                let right_hits = match comparison.right.store.read_page(start, count) {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        Vec::new()
+                    }
+                };
+                let left_previews = left_hits
+                    .iter()
+                    .map(|hit| build_search_preview(&comparison.left.document, *hit))
+                    .collect::<Vec<_>>();
+                let right_previews = right_hits
+                    .iter()
+                    .map(|hit| build_search_preview(&comparison.right.document, *hit))
+                    .collect::<Vec<_>>();
+
+                for relative in 0..count {
+                    let result_index = start + relative as u64;
+                    let left_hit = left_hits.get(relative).copied();
+                    let right_hit = right_hits.get(relative).copied();
+                    let left_preview = left_previews.get(relative);
+                    let right_preview = right_previews.get(relative);
+                    let kind = search_comparison_row_kind(left_preview, right_preview);
+                    let (left_width, right_width) =
+                        search_comparison_pane_widths(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        if show_search_comparison_cell(
+                            ui,
+                            left_width,
+                            result_index,
+                            left_hit,
+                            left_preview,
+                            kind,
+                            SearchComparisonSide::Left,
+                        ) {
+                            action.jump = left_hit.map(|hit| (SearchComparisonSide::Left, hit));
+                        }
+                        show_search_comparison_divider(ui, SEARCH_COMPARISON_ROW_HEIGHT);
+                        if show_search_comparison_cell(
+                            ui,
+                            right_width,
+                            result_index,
+                            right_hit,
+                            right_preview,
+                            kind,
+                            SearchComparisonSide::Right,
+                        ) {
+                            action.jump = right_hit.map(|hit| (SearchComparisonSide::Right, hit));
+                        }
+                    });
+                }
+            },
+        );
+    if let Some(error) = read_error {
+        ui.colored_label(
+            Color32::from_rgb(244, 135, 113),
+            format!("读取对比结果失败：{error}"),
+        );
+    }
+    action
+}
+
+fn search_comparison_pane_widths(total_width: f32) -> (f32, f32) {
+    let content_width = (total_width - SEARCH_COMPARISON_DIVIDER_WIDTH).max(0.0);
+    let left_width = content_width * 0.5;
+    (left_width, content_width - left_width)
+}
+
+fn show_search_comparison_headers(
+    ui: &mut egui::Ui,
+    comparison: &SearchComparison,
+    left_count: u64,
+    right_count: u64,
+) {
+    let (left_width, right_width) = search_comparison_pane_widths(ui.available_width());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        show_search_comparison_source_header(ui, left_width, "左侧", &comparison.left, left_count);
+        show_search_comparison_divider(ui, SEARCH_COMPARISON_HEADER_HEIGHT);
+        show_search_comparison_source_header(
+            ui,
+            right_width,
+            "右侧",
+            &comparison.right,
+            right_count,
+        );
+    });
+}
+
+fn show_search_comparison_source_header(
+    ui: &mut egui::Ui,
+    width: f32,
+    side_label: &str,
+    source: &SearchComparisonSource,
+    result_count: u64,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width.max(0.0), SEARCH_COMPARISON_HEADER_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, theme::PANEL);
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0, theme::BORDER),
+    );
+    let inner = rect.shrink2(egui::vec2(8.0, 4.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::top_down(Align::Min)),
+        |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(inner));
+            ui.set_width(inner.width());
+            ui.add_sized(
+                [inner.width(), 17.0],
+                egui::Label::new(
+                    RichText::new(format!("{side_label} · {result_count} 条结果"))
+                        .small()
+                        .strong()
+                        .color(theme::MUTED),
+                )
+                .truncate(),
+            );
+            ui.add_sized(
+                [inner.width(), 21.0],
+                egui::Label::new(
+                    RichText::new(search_comparison_source_label(source))
+                        .strong()
+                        .color(theme::TEXT),
+                )
+                .truncate(),
+            )
+            .on_hover_text(search_comparison_source_label(source));
+        },
+    );
+}
+
+fn show_search_comparison_divider(ui: &mut egui::Ui, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(SEARCH_COMPARISON_DIVIDER_WIDTH, height),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, theme::BORDER);
+}
+
+fn search_comparison_row_kind(
+    left: Option<&SearchPreview>,
+    right: Option<&SearchPreview>,
+) -> SearchComparisonRowKind {
+    match (left, right) {
+        (Some(left), Some(right)) if left.text == right.text => SearchComparisonRowKind::Equal,
+        (Some(_), Some(_)) => SearchComparisonRowKind::Different,
+        (Some(_), None) => SearchComparisonRowKind::LeftOnly,
+        (None, Some(_)) => SearchComparisonRowKind::RightOnly,
+        (None, None) => SearchComparisonRowKind::Equal,
+    }
+}
+
+fn show_search_comparison_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    result_index: u64,
+    hit: Option<SearchHit>,
+    preview: Option<&SearchPreview>,
+    kind: SearchComparisonRowKind,
+    side: SearchComparisonSide,
+) -> bool {
+    let background = match (kind, side) {
+        (SearchComparisonRowKind::Equal, _) => theme::BACKGROUND,
+        (SearchComparisonRowKind::Different, _) => theme::DIFF_REPLACE,
+        (SearchComparisonRowKind::LeftOnly, SearchComparisonSide::Left) => theme::DIFF_DELETE,
+        (SearchComparisonRowKind::RightOnly, SearchComparisonSide::Right) => theme::DIFF_INSERT,
+        _ => theme::PANEL,
+    };
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width.max(0.0), SEARCH_COMPARISON_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, background);
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0, theme::BORDER),
+    );
+    let mut jump = false;
+    let inner = rect.shrink2(egui::vec2(7.0, 2.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::top_down(Align::Min)),
+        |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(inner));
+            ui.set_width(inner.width());
+            let Some(preview) = preview else {
+                ui.add_sized(
+                    [inner.width(), 18.0],
+                    egui::Label::new(RichText::new("—").monospace().color(theme::MUTED)),
+                );
+                return;
+            };
+            let line = preview.line_number.map_or_else(
+                || format!("位置 {}", preview.byte_start),
+                |line| format!("行 {line}"),
+            );
+            jump = ui
+                .add_sized(
+                    [inner.width(), 18.0],
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "#{} · {line} · {}",
+                            result_index + 1,
+                            search_comparison_kind_label(kind, side)
+                        ))
+                        .monospace()
+                        .color(theme::MUTED),
+                    )
+                    .truncate()
+                    .sense(Sense::click()),
+                )
+                .on_hover_text("跳转到该搜索命中")
+                .clicked()
+                && hit.is_some();
+            ui.add(
+                egui::Label::new(search_preview_layout(preview, theme::TEXT))
+                    .truncate()
+                    .selectable(true),
+            )
+            .on_hover_text(&preview.text);
+        },
+    );
+    jump
+}
+
+fn search_comparison_kind_label(
+    kind: SearchComparisonRowKind,
+    side: SearchComparisonSide,
+) -> &'static str {
+    match (kind, side) {
+        (SearchComparisonRowKind::Equal, _) => "相同",
+        (SearchComparisonRowKind::Different, _) => "不同",
+        (SearchComparisonRowKind::LeftOnly, SearchComparisonSide::Left) => "仅左侧",
+        (SearchComparisonRowKind::RightOnly, SearchComparisonSide::Right) => "仅右侧",
+        _ => "无对应项",
+    }
+}
+
+fn search_comparison_source_label(source: &SearchComparisonSource) -> String {
+    let file = source.key.path.file_name().map_or_else(
+        || source.key.path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    format!("{file} · #{} “{}”", source.key.session_id, source.query)
+}
+
+fn show_search_results(
+    ui: &mut egui::Ui,
+    tab: &mut DocumentView,
+    compare_left: Option<&SearchComparisonSource>,
+) -> Option<SearchComparisonSource> {
     let mut close_panel = false;
     let mut collapse_all = false;
     let mut clear_all = false;
@@ -1904,14 +2576,24 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
             }
         });
     });
+    if let Some(compare_left) = compare_left {
+        ui.label(
+            RichText::new(format!(
+                "左侧已选择：{}。请在当前或其他文件中点击另一组“⇄”。",
+                search_comparison_source_label(compare_left)
+            ))
+            .small()
+            .color(theme::ACCENT),
+        );
+    }
 
     if close_panel {
         tab.search_results_open = false;
-        return;
+        return None;
     }
     if clear_all {
         tab.clear_search_sessions();
-        return;
+        return None;
     }
     if collapse_all {
         for session in &mut tab.search_sessions {
@@ -1923,7 +2605,10 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
     let total_rows = usize::try_from(total_rows_u64).unwrap_or(usize::MAX);
     let active_session_id = tab.search_task.as_ref().map(|task| task.session_id);
     let document = Arc::clone(&tab.document);
-    let mut scroll_area = ScrollArea::vertical()
+    let search_viewport_width = ui.available_width();
+    let search_select_all = tab.search_select_all;
+    let selected_search_hit = tab.selected_search_hit;
+    let mut scroll_area = ScrollArea::both()
         .id_salt(("search_sessions", &tab.path))
         .auto_shrink([false, false]);
     if let Some(offset) = tab.search_scroll_offset.take() {
@@ -1933,6 +2618,9 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
     let mut read_error = None;
     let mut toggle_session = None;
     let mut remove_session = None;
+    let mut compare_session = None;
+    let mut select_result_row = None;
+    let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
     scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
         let visible_start = visible.start as u64;
@@ -1943,13 +2631,23 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
             }
             let session = &mut tab.search_sessions[layout.session_index];
             if visible_start <= layout.header_row && layout.header_row < visible_end {
-                let action =
-                    show_search_session_header(ui, session, active_session_id == Some(session.id));
+                let is_compare_left = compare_left.is_some_and(|source| {
+                    source.key.path == tab.path && source.key.session_id == session.id
+                });
+                let action = show_search_session_header(
+                    ui,
+                    session,
+                    active_session_id == Some(session.id),
+                    is_compare_left,
+                );
                 if action.toggle {
                     toggle_session = Some(session.id);
                 }
                 if action.remove {
                     remove_session = Some(session.id);
+                }
+                if action.compare {
+                    compare_session = Some(session.id);
                 }
             }
             if !session.expanded {
@@ -1982,9 +2680,23 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
                     session.preview_cache.insert(hit_index, preview.clone());
                     preview
                 };
-                if show_search_result_row(ui, hit_index, &preview) {
+                let is_selected =
+                    search_select_all || selected_search_hit == Some((session.id, hit_index));
+                let action = show_search_result_row(
+                    ui,
+                    session.id,
+                    hit_index,
+                    &preview,
+                    is_selected,
+                    search_viewport_width,
+                );
+                if action.activate {
                     selected_hit = Some((session.query.clone(), hit));
                 }
+                if action.select_line {
+                    select_result_row = Some((session.id, hit_index));
+                }
+                began_text_selection |= action.begin_text_selection;
             }
         }
     });
@@ -2000,6 +2712,15 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
     if let Some(session_id) = remove_session {
         tab.remove_search_session(session_id);
     }
+    if let Some((session_id, hit_index)) = select_result_row {
+        tab.select_search_hit(session_id, hit_index);
+        ui.ctx()
+            .plugin::<LabelSelectionState>()
+            .lock()
+            .clear_selection();
+    } else if began_text_selection {
+        tab.begin_search_text_selection();
+    }
     if let Some((query, hit)) = selected_hit {
         tab.query = query;
         tab.refresh_highlights();
@@ -2008,18 +2729,35 @@ fn show_search_results(ui: &mut egui::Ui, tab: &mut DocumentView) {
     if let Some(error) = read_error {
         tab.status_message = format!("无法读取搜索结果：{error}");
     }
+
+    compare_session.and_then(|session_id| {
+        tab.search_sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| SearchComparisonSource {
+                key: SearchSessionKey {
+                    path: tab.path.clone(),
+                    session_id,
+                },
+                document: Arc::clone(&tab.document),
+                query: session.query.clone(),
+                store: Arc::clone(&session.store),
+            })
+    })
 }
 
 #[derive(Default)]
 struct SearchSessionHeaderAction {
     toggle: bool,
     remove: bool,
+    compare: bool,
 }
 
 fn show_search_session_header(
     ui: &mut egui::Ui,
     session: &SearchSession,
     is_running: bool,
+    is_compare_left: bool,
 ) -> SearchSessionHeaderAction {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width().max(1.0), SEARCH_RESULT_ROW_HEIGHT),
@@ -2057,6 +2795,17 @@ fn show_search_session_header(
                 .clicked()
             {
                 action.toggle = true;
+            }
+            if ui
+                .small_button(if is_compare_left { "左" } else { "⇄" })
+                .on_hover_text(if is_compare_left {
+                    "取消这组对比选择"
+                } else {
+                    "选择这组搜索结果进行对比"
+                })
+                .clicked()
+            {
+                action.compare = true;
             }
             let title = ui.add(
                 egui::Label::new(
@@ -2169,66 +2918,117 @@ fn build_search_preview(document: &TextDocument, hit: SearchHit) -> SearchPrevie
     }
 }
 
-fn show_search_result_row(ui: &mut egui::Ui, absolute_index: u64, preview: &SearchPreview) -> bool {
+#[derive(Default)]
+struct SearchResultRowAction {
+    activate: bool,
+    select_line: bool,
+    begin_text_selection: bool,
+}
+
+fn show_search_result_row(
+    ui: &mut egui::Ui,
+    session_id: u64,
+    absolute_index: u64,
+    preview: &SearchPreview,
+    selected: bool,
+    viewport_width: f32,
+) -> SearchResultRowAction {
     let line = preview.line_number.map_or_else(
         || format!("位置 {}", preview.byte_start),
         |line| format!("行 {line}"),
     );
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width().max(1.0), SEARCH_RESULT_ROW_HEIGHT),
-        Sense::click(),
+    let text_color = if selected {
+        theme::TEXT_ON_SELECTION
+    } else {
+        theme::TEXT
+    };
+    let secondary_text_color = if selected {
+        theme::MUTED_ON_SELECTION
+    } else {
+        theme::MUTED
+    };
+    let preview_job = search_preview_layout(preview, text_color);
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(preview_job));
+    let minimum_width =
+        SEARCH_RESULT_INDEX_WIDTH + SEARCH_RESULT_LINE_WIDTH + galley.size().x + 12.0;
+    let row_width = viewport_width.max(minimum_width).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(row_width, SEARCH_RESULT_ROW_HEIGHT),
+        Sense::hover(),
     );
     ui.painter().rect_filled(
         rect,
         0.0,
-        if absolute_index.is_multiple_of(2) {
+        if selected {
+            theme::SELECTED_LINE
+        } else if absolute_index.is_multiple_of(2) {
             theme::BACKGROUND
         } else {
             theme::PANEL
         },
     );
 
-    let mut content_clicked = false;
     let inner = rect.shrink2(egui::vec2(4.0, 0.0));
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            content_clicked |= ui
-                .add_sized(
-                    [78.0, SEARCH_RESULT_ROW_HEIGHT],
-                    egui::Label::new(
-                        RichText::new(format!("#{}", absolute_index + 1))
-                            .monospace()
-                            .color(theme::MUTED),
-                    )
-                    .sense(Sense::click()),
-                )
-                .clicked();
-            content_clicked |= ui
-                .add_sized(
-                    [112.0, SEARCH_RESULT_ROW_HEIGHT],
-                    egui::Label::new(RichText::new(line).monospace().color(theme::MUTED))
-                        .sense(Sense::click()),
-                )
-                .clicked();
-            content_clicked |= ui
-                .add(
-                    egui::Label::new(search_preview_layout(preview))
-                        .truncate()
-                        .sense(Sense::click()),
-                )
-                .clicked();
-        },
+    let index_rect = egui::Rect::from_min_size(
+        inner.left_top(),
+        egui::vec2(SEARCH_RESULT_INDEX_WIDTH, inner.height()),
     );
-    response.clicked() || content_clicked
+    let line_rect = egui::Rect::from_min_size(
+        egui::pos2(index_rect.right(), inner.top()),
+        egui::vec2(SEARCH_RESULT_LINE_WIDTH, inner.height()),
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(line_rect.right(), inner.top()),
+        inner.right_bottom(),
+    );
+    let row_id = ui.make_persistent_id((
+        "search_result_row",
+        session_id,
+        absolute_index,
+        preview.byte_start,
+    ));
+    let index_response = ui.interact(index_rect, row_id.with("index"), Sense::click());
+    let line_response = ui.interact(line_rect, row_id.with("line"), Sense::click());
+    let text_response = ui.interact(text_rect, row_id.with("text"), Sense::click_and_drag());
+
+    ui.painter().text(
+        index_rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        format!("#{}", absolute_index + 1),
+        FontId::monospace(13.0),
+        secondary_text_color,
+    );
+    ui.painter().text(
+        line_rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        line,
+        FontId::monospace(13.0),
+        secondary_text_color,
+    );
+    let galley_pos = egui::pos2(
+        text_rect.left(),
+        text_rect.center().y - galley.size().y * 0.5,
+    );
+    LabelSelectionState::label_text_selection(
+        ui,
+        &text_response,
+        galley_pos,
+        galley,
+        text_color,
+        egui::Stroke::NONE,
+    );
+
+    SearchResultRowAction {
+        activate: text_response.clicked(),
+        select_line: index_response.clicked() || line_response.clicked(),
+        begin_text_selection: text_response.clicked() || text_response.drag_started(),
+    }
 }
 
-fn search_preview_layout(preview: &SearchPreview) -> LayoutJob {
+fn search_preview_layout(preview: &SearchPreview, text_color: Color32) -> LayoutJob {
     let normal = TextFormat {
         font_id: FontId::monospace(13.0),
-        color: Color32::from_rgb(212, 212, 212),
+        color: text_color,
         ..Default::default()
     };
     let marked = TextFormat {
@@ -2254,17 +3054,30 @@ fn search_preview_layout(preview: &SearchPreview) -> LayoutJob {
 
 fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     let row_height = ui.text_style_height(&TextStyle::Monospace) + 4.0;
+    let scroll_height = (ui.available_height() - HORIZONTAL_SCROLLBAR_HEIGHT).max(row_height);
     let total_rows = tab.window.lines.len();
+    let scroll_to_bottom = std::mem::take(&mut tab.editor_stick_to_bottom);
     let highlights = &tab.highlights;
     let query = &tab.query;
+    let selected_editor_line = tab.selected_editor_line;
+    let editor_select_all = tab.editor_select_all;
     let mut visible_rows = 0..0;
+    let mut selected_line = None;
+    let mut began_text_selection = false;
     let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
     let mut scroll_area = ScrollArea::both()
         .id_salt(("editor_scroll", &tab.path, tab.editor_scroll_revision))
         .auto_shrink([false, false])
+        .max_height(scroll_height)
         .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
-        .stick_to_bottom(tab.editor_stick_to_bottom);
-    if let Some(offset) = tab.editor_scroll_offset.take() {
+        .horizontal_scroll_offset(tab.editor_horizontal_offset)
+        .stick_to_bottom(scroll_to_bottom);
+    if scroll_to_bottom {
+        let content_height = row_height * total_rows as f32;
+        scroll_area = scroll_area
+            .vertical_scroll_offset(editor_max_scroll_offset(content_height, scroll_height));
+        tab.editor_scroll_offset = None;
+    } else if let Some(offset) = tab.editor_scroll_offset.take() {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -2272,31 +3085,41 @@ fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
         visible_rows = rows.clone();
         for row in rows {
             let line = &tab.window.lines[row];
-            let line_number = line
-                .line_number
-                .map_or_else(|| "·".into(), |number| number.to_string());
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [76.0, row_height],
-                    egui::Label::new(
-                        RichText::new(format!("{line_number:>9}"))
-                            .monospace()
-                            .color(theme::MUTED),
-                    )
-                    .selectable(false),
-                );
-                let job = line_layout_job(line.text.as_str(), row, highlights, query);
-                ui.add(
-                    egui::Label::new(job)
-                        .extend()
-                        .selectable(true)
-                        .sense(Sense::click_and_drag()),
-                );
-            });
+            let is_selected = editor_select_all || selected_editor_line == Some(line.byte_start);
+            let action = show_text_row(ui, line, row, row_height, highlights, query, is_selected);
+            if action.select_line {
+                selected_line = Some(line.byte_start);
+            }
+            began_text_selection |= action.begin_text_selection;
         }
     });
+    if let Some(byte_start) = selected_line {
+        tab.select_editor_line(byte_start);
+        ui.ctx()
+            .plugin::<LabelSelectionState>()
+            .lock()
+            .clear_selection();
+    } else if began_text_selection {
+        tab.begin_editor_text_selection();
+    }
+    tab.editor_visible_line_capacity =
+        (output.inner_rect.height() / row_height).floor().max(1.0) as u64;
+    tab.editor_horizontal_offset = output.state.offset.x;
+    show_horizontal_scrollbar(
+        ui,
+        &mut tab.editor_horizontal_offset,
+        &mut tab.editor_horizontal_drag_offset,
+        output.content_size.x,
+        output.inner_rect.width(),
+    );
     tab.visible_row = Some(visible_rows.start);
-    if let Some(line) = tab.window.lines.get(visible_rows.start) {
+    let maximum_vertical_offset =
+        editor_max_scroll_offset(output.content_size.y, output.inner_rect.height());
+    let at_document_bottom = tab.window.reached_end
+        && editor_scroll_is_at_bottom(output.state.offset.y, maximum_vertical_offset);
+    if at_document_bottom {
+        tab.requested_offset = tab.document.len();
+    } else if let Some(line) = tab.window.lines.get(visible_rows.start) {
         tab.requested_offset = line.byte_start;
     }
 
@@ -2316,17 +3139,204 @@ fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     }
 }
 
+fn show_horizontal_scrollbar(
+    ui: &mut egui::Ui,
+    offset: &mut f32,
+    drag_offset: &mut Option<f32>,
+    content_width: f32,
+    viewport_width: f32,
+) {
+    let (track, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(1.0), HORIZONTAL_SCROLLBAR_HEIGHT),
+        Sense::click_and_drag(),
+    );
+    let (max_offset, thumb_width, travel) =
+        horizontal_scrollbar_geometry(track.width(), viewport_width, content_width);
+    *offset = offset.clamp(0.0, max_offset);
+    if max_offset <= f32::EPSILON {
+        *offset = 0.0;
+        *drag_offset = None;
+    }
+
+    let initial_thumb_left = if max_offset <= f32::EPSILON {
+        track.left()
+    } else {
+        track.left() + travel * (*offset / max_offset)
+    };
+    let initial_thumb = egui::Rect::from_min_size(
+        egui::pos2(initial_thumb_left, track.top() + 2.0),
+        egui::vec2(thumb_width, (track.height() - 4.0).max(2.0)),
+    );
+
+    if max_offset > f32::EPSILON
+        && response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *drag_offset = Some(if initial_thumb.contains(pointer) {
+            pointer.x - initial_thumb.left()
+        } else {
+            thumb_width * 0.5
+        });
+    }
+    if max_offset > f32::EPSILON
+        && (response.dragged() || response.clicked())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let grab = drag_offset.unwrap_or(thumb_width * 0.5);
+        let ratio = if travel <= f32::EPSILON {
+            0.0
+        } else {
+            ((pointer.x - grab - track.left()) / travel).clamp(0.0, 1.0)
+        };
+        *offset = ratio * max_offset;
+    }
+    if response.drag_stopped() {
+        *drag_offset = None;
+    }
+
+    let thumb_left = if max_offset <= f32::EPSILON {
+        track.left()
+    } else {
+        track.left() + travel * (*offset / max_offset)
+    };
+    let thumb = egui::Rect::from_min_size(
+        egui::pos2(thumb_left, track.top() + 2.0),
+        egui::vec2(thumb_width, (track.height() - 4.0).max(2.0)),
+    );
+    ui.painter().rect_filled(track, 0.0, theme::PANEL);
+    ui.painter().line_segment(
+        [track.left_top(), track.right_top()],
+        egui::Stroke::new(1.0, theme::BORDER),
+    );
+    ui.painter().rect_filled(
+        thumb,
+        2.0,
+        if max_offset <= f32::EPSILON {
+            theme::BORDER
+        } else if response.hovered() || response.dragged() {
+            Color32::from_rgb(117, 117, 117)
+        } else {
+            Color32::from_rgb(82, 82, 82)
+        },
+    );
+    if max_offset > f32::EPSILON {
+        response
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            .on_hover_text(format!("横向位置：{:.1}%", *offset / max_offset * 100.0));
+    }
+}
+
+fn horizontal_scrollbar_geometry(
+    track_width: f32,
+    viewport_width: f32,
+    content_width: f32,
+) -> (f32, f32, f32) {
+    let track_width = track_width.max(1.0);
+    let viewport_width = viewport_width.max(1.0);
+    let content_width = content_width.max(viewport_width);
+    let max_offset = (content_width - viewport_width).max(0.0);
+    let thumb_width = (track_width * viewport_width / content_width)
+        .clamp(MIN_SCROLLBAR_THUMB_WIDTH.min(track_width), track_width);
+    let travel = (track_width - thumb_width).max(0.0);
+    (max_offset, thumb_width, travel)
+}
+
+#[derive(Default)]
+struct TextRowAction {
+    select_line: bool,
+    begin_text_selection: bool,
+}
+
+fn show_text_row(
+    ui: &mut egui::Ui,
+    line: &nkg_text_engine::LineSlice,
+    line_index: usize,
+    row_height: f32,
+    highlights: &[HighlightSpan],
+    query: &str,
+    selected: bool,
+) -> TextRowAction {
+    let text_color = if selected {
+        theme::TEXT_ON_SELECTION
+    } else {
+        theme::TEXT
+    };
+    let secondary_text_color = if selected {
+        theme::MUTED_ON_SELECTION
+    } else {
+        theme::MUTED
+    };
+    let job = line_layout_job(
+        line.text.as_str(),
+        line_index,
+        highlights,
+        query,
+        text_color,
+        secondary_text_color,
+    );
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let spacing = ui.spacing().item_spacing.x;
+    let minimum_width = EDITOR_GUTTER_WIDTH + spacing + galley.size().x;
+    let row_width = ui.available_width().max(minimum_width).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::hover());
+    if selected {
+        ui.painter().rect_filled(rect, 0.0, theme::SELECTED_LINE);
+    }
+
+    let number_rect = egui::Rect::from_min_size(
+        rect.left_top(),
+        egui::vec2(EDITOR_GUTTER_WIDTH, rect.height()),
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(number_rect.right() + spacing, rect.top()),
+        rect.right_bottom(),
+    );
+    let row_id = ui.make_persistent_id(("editor_row", line.byte_start));
+    let number_response = ui.interact(number_rect, row_id.with("number"), Sense::click());
+    let text_response = ui.interact(text_rect, row_id.with("text"), Sense::click_and_drag());
+    let line_number = line
+        .line_number
+        .map_or_else(|| "·".into(), |number| number.to_string());
+    ui.painter().text(
+        number_rect.right_center(),
+        egui::Align2::RIGHT_CENTER,
+        format!("{line_number:>9}"),
+        FontId::monospace(13.0),
+        secondary_text_color,
+    );
+
+    let galley_pos = egui::pos2(
+        text_rect.left(),
+        text_rect.center().y - galley.size().y * 0.5,
+    );
+    LabelSelectionState::label_text_selection(
+        ui,
+        &text_response,
+        galley_pos,
+        galley,
+        text_color,
+        egui::Stroke::NONE,
+    );
+
+    TextRowAction {
+        select_line: number_response.clicked(),
+        begin_text_selection: text_response.clicked() || text_response.drag_started(),
+    }
+}
+
 fn line_layout_job(
     text: &str,
     line_index: usize,
     highlights: &[HighlightSpan],
     query: &str,
+    text_color: Color32,
+    secondary_text_color: Color32,
 ) -> LayoutJob {
     let display_end = floor_char_boundary(text, text.len().min(MAX_DISPLAY_LINE_BYTES));
     let displayed = &text[..display_end];
     let normal = TextFormat {
         font_id: FontId::monospace(13.0),
-        color: Color32::from_rgb(212, 212, 212),
+        color: text_color,
         ..Default::default()
     };
     let marked = TextFormat {
@@ -2363,7 +3373,7 @@ fn line_layout_job(
             0.0,
             TextFormat {
                 font_id: FontId::monospace(13.0),
-                color: theme::MUTED,
+                color: secondary_text_color,
                 ..Default::default()
             },
         );
@@ -2445,6 +3455,27 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use std::{io::Write, sync::atomic::AtomicBool};
+
+    #[test]
+    fn file_overview_thumb_uses_line_ratio_with_height_limits() {
+        assert_eq!(file_overview_thumb_height(600.0, 40, 80), 120.0);
+        assert_eq!(file_overview_thumb_height(600.0, 40, 400), 60.0);
+        assert_eq!(file_overview_thumb_height(600.0, 40, 4_000), 28.0);
+        assert_eq!(file_overview_thumb_height(24.0, 40, 400), 24.0);
+    }
+
+    #[test]
+    fn overview_end_uses_the_exact_editor_bottom_offset() {
+        let row_height = 20.0;
+        let total_rows = 5_000;
+        let viewport_height = 600.0;
+        let maximum = editor_max_scroll_offset(row_height * total_rows as f32, viewport_height);
+
+        assert_eq!(maximum, 99_400.0);
+        assert!(editor_scroll_is_at_bottom(maximum, maximum));
+        assert!(!editor_scroll_is_at_bottom(maximum - 2.0, maximum));
+        assert_eq!((maximum / row_height) as usize, total_rows - 30);
+    }
 
     #[test]
     fn overview_end_loads_the_tail_and_aligns_it_to_the_viewport_bottom() {
@@ -2532,6 +3563,145 @@ mod tests {
         assert_eq!(search_session_rows(&view.search_sessions).1, 6);
         view.search_sessions[0].expanded = false;
         assert_eq!(search_session_rows(&view.search_sessions).1, 4);
+    }
+
+    #[test]
+    fn select_all_targets_the_last_used_text_surface() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "first").unwrap();
+        writeln!(file, "second").unwrap();
+        file.flush().unwrap();
+
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        view.select_all();
+        assert!(view.editor_select_all);
+        assert!(!view.search_select_all);
+
+        view.begin_search_text_selection();
+        view.select_all();
+        assert!(view.search_select_all);
+        assert_eq!(view.selected_search_hit, None);
+
+        view.select_search_hit(7, 3);
+        assert!(!view.search_select_all);
+        assert_eq!(view.selected_search_hit, Some((7, 3)));
+
+        view.select_editor_line(view.window.lines[1].byte_start);
+        assert!(!view.editor_select_all);
+        assert_eq!(
+            view.selected_editor_line,
+            Some(view.window.lines[1].byte_start)
+        );
+    }
+
+    #[test]
+    fn search_comparison_accepts_same_file_and_cross_file_sessions() {
+        let mut first_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(first_file, "alpha").unwrap();
+        first_file.flush().unwrap();
+        let mut second_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(second_file, "beta").unwrap();
+        second_file.flush().unwrap();
+
+        let left = comparison_source(first_file.path(), 1, "alpha");
+        let same_file_right = comparison_source(first_file.path(), 2, "beta");
+        let cross_file_right = comparison_source(second_file.path(), 1, "beta");
+
+        let mut pending = None;
+        assert!(matches!(
+            update_search_comparison_choice(&mut pending, left.clone()),
+            SearchComparisonChoice::AwaitingRight
+        ));
+        let SearchComparisonChoice::Ready(same_file) =
+            update_search_comparison_choice(&mut pending, same_file_right)
+        else {
+            panic!("same-file sessions should create a comparison");
+        };
+        assert_eq!(same_file.left.key.path, same_file.right.key.path);
+
+        let mut pending = None;
+        update_search_comparison_choice(&mut pending, left.clone());
+        let SearchComparisonChoice::Ready(cross_file) =
+            update_search_comparison_choice(&mut pending, cross_file_right)
+        else {
+            panic!("cross-file sessions should create a comparison");
+        };
+        assert_ne!(cross_file.left.key.path, cross_file.right.key.path);
+
+        let mut pending = None;
+        update_search_comparison_choice(&mut pending, left.clone());
+        assert!(matches!(
+            update_search_comparison_choice(&mut pending, left),
+            SearchComparisonChoice::Cancelled
+        ));
+    }
+
+    #[test]
+    fn search_comparison_rows_classify_equal_changed_and_one_sided_results() {
+        let first = SearchPreview {
+            line_number: Some(1),
+            text: "same".into(),
+            match_range: None,
+            byte_start: 0,
+        };
+        let same = first.clone();
+        let changed = SearchPreview {
+            text: "changed".into(),
+            ..first.clone()
+        };
+
+        assert_eq!(
+            search_comparison_row_kind(Some(&first), Some(&same)),
+            SearchComparisonRowKind::Equal
+        );
+        assert_eq!(
+            search_comparison_row_kind(Some(&first), Some(&changed)),
+            SearchComparisonRowKind::Different
+        );
+        assert_eq!(
+            search_comparison_row_kind(Some(&first), None),
+            SearchComparisonRowKind::LeftOnly
+        );
+        assert_eq!(
+            search_comparison_row_kind(None, Some(&first)),
+            SearchComparisonRowKind::RightOnly
+        );
+    }
+
+    #[test]
+    fn search_comparison_panes_always_fit_the_available_width() {
+        for total_width in [0.0, 320.0, 1_001.0, 3_200.0] {
+            let (left, right) = search_comparison_pane_widths(total_width);
+            let expected_content = (total_width - SEARCH_COMPARISON_DIVIDER_WIDTH).max(0.0);
+            assert!((left + right - expected_content).abs() < f32::EPSILON);
+            assert!((left - right).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn horizontal_scrollbar_thumb_tracks_the_visible_content_fraction() {
+        let (max_offset, thumb_width, travel) =
+            horizontal_scrollbar_geometry(500.0, 250.0, 1_000.0);
+        assert_eq!(max_offset, 750.0);
+        assert_eq!(thumb_width, 125.0);
+        assert_eq!(travel, 375.0);
+
+        let (max_offset, thumb_width, travel) = horizontal_scrollbar_geometry(500.0, 500.0, 200.0);
+        assert_eq!(max_offset, 0.0);
+        assert_eq!(thumb_width, 500.0);
+        assert_eq!(travel, 0.0);
+    }
+
+    fn comparison_source(path: &Path, session_id: u64, query: &str) -> SearchComparisonSource {
+        SearchComparisonSource {
+            key: SearchSessionKey {
+                path: path.to_path_buf(),
+                session_id,
+            },
+            document: TextDocument::open(path).unwrap(),
+            query: query.into(),
+            store: Arc::new(SearchHitStore::create().unwrap()),
+        }
     }
 
     fn wait_for_search(view: &mut DocumentView) {
