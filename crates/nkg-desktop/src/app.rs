@@ -48,6 +48,11 @@ const SEARCH_RESULT_INDEX_WIDTH: f32 = 78.0;
 const SEARCH_RESULT_LINE_WIDTH: f32 = 112.0;
 const MIN_FILE_OVERVIEW_THUMB_HEIGHT: f32 = 28.0;
 const MAX_FILE_OVERVIEW_THUMB_HEIGHT: f32 = 120.0;
+const HOME_TITLE_SIZE: f32 = 28.0;
+const HOME_SUBTITLE_SIZE: f32 = 16.0;
+const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
+const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
+const HOME_HINT_SIZE: f32 = 14.0;
 
 fn file_overview_thumb_height(track_height: f32, visible_lines: u64, total_lines: u64) -> f32 {
     let track_height = track_height.max(0.0);
@@ -85,6 +90,15 @@ fn editor_scroll_is_at_bottom(offset: f32, maximum_offset: f32) -> bool {
     maximum_offset <= f32::EPSILON || offset >= maximum_offset - 1.0
 }
 
+fn should_select_search_query(
+    query_is_empty: bool,
+    focus_requested: bool,
+    clicked: bool,
+    gained_focus: bool,
+) -> bool {
+    !query_is_empty && (focus_requested || (clicked && gained_focus))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SelectionSurface {
     #[default]
@@ -97,6 +111,19 @@ enum SidebarMode {
     Explorer,
     Search,
     Compare,
+}
+
+fn toggle_sidebar_mode(
+    visible: &mut bool,
+    current_mode: &mut SidebarMode,
+    requested_mode: SidebarMode,
+) {
+    if *visible && *current_mode == requested_mode {
+        *visible = false;
+    } else {
+        *current_mode = requested_mode;
+        *visible = true;
+    }
 }
 
 enum SearchEvent {
@@ -599,7 +626,18 @@ impl DocumentView {
     }
 
     fn jump_to_hit(&mut self, hit: SearchHit) {
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
         self.load_offset(hit.byte_start);
+        if let Some(line_start) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start <= hit.byte_start && hit.byte_start < line.byte_end)
+            .map(|line| line.byte_start)
+        {
+            self.select_editor_line(line_start);
+        }
         self.status_message = format!("搜索命中：{}..{}", hit.byte_start, hit.byte_end);
     }
 
@@ -844,6 +882,7 @@ pub struct NkgApp {
     search_comparison: Option<SearchComparison>,
     active_tab: usize,
     sidebar_mode: SidebarMode,
+    sidebar_visible: bool,
     path_input: String,
     global_message: String,
     search_focus_requested: bool,
@@ -876,6 +915,7 @@ impl NkgApp {
             search_comparison: None,
             active_tab: 0,
             sidebar_mode: SidebarMode::Explorer,
+            sidebar_visible: false,
             path_input: String::new(),
             global_message: "就绪".into(),
             search_focus_requested: false,
@@ -890,6 +930,7 @@ impl NkgApp {
         }
         if let Some(query) = initial_search {
             app.sidebar_mode = SidebarMode::Search;
+            app.sidebar_visible = true;
             if let Some(tab) = app.active_mut() {
                 tab.query = query;
                 tab.refresh_highlights();
@@ -943,6 +984,7 @@ impl NkgApp {
             Ok(diff) => {
                 self.diff = Some(diff);
                 self.sidebar_mode = SidebarMode::Compare;
+                self.sidebar_visible = true;
             }
             Err(error) => self.global_message = format!("无法开始对比：{error}"),
         }
@@ -985,6 +1027,7 @@ impl NkgApp {
             SearchComparisonChoice::Ready(comparison) => {
                 self.search_comparison = Some(comparison);
                 self.sidebar_mode = SidebarMode::Search;
+                self.sidebar_visible = true;
                 if let Some(tab) = self.active_mut() {
                     tab.status_message = "已打开搜索结果对比".into();
                 }
@@ -1007,6 +1050,7 @@ impl NkgApp {
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::F)) {
             self.sidebar_mode = SidebarMode::Search;
+            self.sidebar_visible = true;
             self.search_focus_requested = true;
         }
         let select_all = !context.egui_wants_keyboard_input()
@@ -1150,27 +1194,46 @@ impl NkgApp {
                         ui,
                         "文",
                         "资源管理器",
-                        self.sidebar_mode == SidebarMode::Explorer,
+                        self.sidebar_visible && self.sidebar_mode == SidebarMode::Explorer,
                     ) {
-                        self.sidebar_mode = SidebarMode::Explorer;
+                        toggle_sidebar_mode(
+                            &mut self.sidebar_visible,
+                            &mut self.sidebar_mode,
+                            SidebarMode::Explorer,
+                        );
                     }
-                    if activity_button(ui, "搜", "搜索", self.sidebar_mode == SidebarMode::Search)
-                    {
-                        self.sidebar_mode = SidebarMode::Search;
+                    if activity_button(
+                        ui,
+                        "搜",
+                        "搜索",
+                        self.sidebar_visible && self.sidebar_mode == SidebarMode::Search,
+                    ) {
+                        toggle_sidebar_mode(
+                            &mut self.sidebar_visible,
+                            &mut self.sidebar_mode,
+                            SidebarMode::Search,
+                        );
                     }
                     if activity_button(
                         ui,
                         "比",
                         "文件对比",
-                        self.sidebar_mode == SidebarMode::Compare,
+                        self.sidebar_visible && self.sidebar_mode == SidebarMode::Compare,
                     ) {
-                        self.sidebar_mode = SidebarMode::Compare;
+                        toggle_sidebar_mode(
+                            &mut self.sidebar_visible,
+                            &mut self.sidebar_mode,
+                            SidebarMode::Compare,
+                        );
                     }
                 });
             });
     }
 
     fn show_sidebar(&mut self, root: &mut egui::Ui) {
+        if !self.sidebar_visible {
+            return;
+        }
         egui::Panel::left("sidebar")
             .default_size(280.0)
             .size_range(220.0..=520.0)
@@ -1246,14 +1309,30 @@ impl NkgApp {
             return;
         };
 
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut tab.query)
-                .hint_text("字面量搜索")
-                .desired_width(f32::INFINITY),
-        );
+        let query_char_count = tab.query.chars().count();
+        let mut output = egui::TextEdit::singleline(&mut tab.query)
+            .hint_text("字面量搜索")
+            .desired_width(f32::INFINITY)
+            .show(ui);
         if focus_requested {
-            response.request_focus();
+            output.response.request_focus();
         }
+        if should_select_search_query(
+            query_char_count == 0,
+            focus_requested,
+            output.response.clicked(),
+            output.response.gained_focus(),
+        ) {
+            output
+                .state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(query_char_count),
+                )));
+            output.state.store(ui.ctx(), output.response.id);
+        }
+        let response = output.response;
         let query_changed = response.changed();
         let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
         ui.horizontal(|ui| {
@@ -1681,17 +1760,34 @@ impl NkgApp {
                 let Some(tab) = self.active_mut() else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
-                            ui.heading("NKG Uni Text Edit");
+                            ui.label(
+                                RichText::new("NKG Uni Text Edit")
+                                    .size(HOME_TITLE_SIZE)
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
                             ui.label(
                                 RichText::new("面向上百 GB 文本的只读查看、搜索与对比工具")
+                                    .size(HOME_SUBTITLE_SIZE)
                                     .color(theme::MUTED),
                             );
-                            if ui.button("打开文件  Ctrl+O").clicked() {
+                            ui.add_space(10.0);
+                            if ui
+                                .add_sized(
+                                    HOME_ACTION_SIZE,
+                                    egui::Button::new(
+                                        RichText::new("打开文件  Ctrl+O")
+                                            .size(HOME_ACTION_TEXT_SIZE),
+                                    ),
+                                )
+                                .clicked()
+                            {
                                 self.open_dialog();
                             }
+                            ui.add_space(4.0);
                             ui.label(
                                 RichText::new("或将文件直接拖到此处")
-                                    .small()
+                                    .size(HOME_HINT_SIZE)
                                     .color(theme::MUTED),
                             );
                         });
@@ -2925,6 +3021,10 @@ struct SearchResultRowAction {
     begin_text_selection: bool,
 }
 
+fn pointer_hits_search_preview(pointer: Option<egui::Pos2>, preview_rect: egui::Rect) -> bool {
+    pointer.is_some_and(|pointer| preview_rect.contains(pointer))
+}
+
 fn show_search_result_row(
     ui: &mut egui::Ui,
     session_id: u64,
@@ -3009,6 +3109,10 @@ fn show_search_result_row(
         text_rect.left(),
         text_rect.center().y - galley.size().y * 0.5,
     );
+    let preview_rect = egui::Rect::from_min_size(galley_pos, galley.size());
+    let text_clicked = text_response.clicked();
+    let preview_clicked = text_clicked
+        && pointer_hits_search_preview(text_response.interact_pointer_pos(), preview_rect);
     LabelSelectionState::label_text_selection(
         ui,
         &text_response,
@@ -3019,9 +3123,9 @@ fn show_search_result_row(
     );
 
     SearchResultRowAction {
-        activate: text_response.clicked(),
-        select_line: index_response.clicked() || line_response.clicked(),
-        begin_text_selection: text_response.clicked() || text_response.drag_started(),
+        activate: preview_clicked,
+        select_line: index_response.clicked() || line_response.clicked() || text_clicked,
+        begin_text_selection: text_response.drag_started(),
     }
 }
 
@@ -3465,6 +3569,32 @@ mod tests {
     }
 
     #[test]
+    fn search_query_is_selected_only_when_entering_the_field() {
+        assert!(should_select_search_query(false, true, false, false));
+        assert!(should_select_search_query(false, false, true, true));
+        assert!(!should_select_search_query(false, false, true, false));
+        assert!(!should_select_search_query(true, true, true, true));
+    }
+
+    #[test]
+    fn activity_buttons_open_switch_and_close_the_sidebar() {
+        let mut visible = false;
+        let mut mode = SidebarMode::Explorer;
+
+        toggle_sidebar_mode(&mut visible, &mut mode, SidebarMode::Explorer);
+        assert!(visible);
+        assert_eq!(mode, SidebarMode::Explorer);
+
+        toggle_sidebar_mode(&mut visible, &mut mode, SidebarMode::Search);
+        assert!(visible);
+        assert_eq!(mode, SidebarMode::Search);
+
+        toggle_sidebar_mode(&mut visible, &mut mode, SidebarMode::Search);
+        assert!(!visible);
+        assert_eq!(mode, SidebarMode::Search);
+    }
+
+    #[test]
     fn overview_end_uses_the_exact_editor_bottom_offset() {
         let row_height = 20.0;
         let total_rows = 5_000;
@@ -3592,6 +3722,45 @@ mod tests {
             view.selected_editor_line,
             Some(view.window.lines[1].byte_start)
         );
+    }
+
+    #[test]
+    fn blank_search_result_space_is_not_treated_as_preview_text() {
+        let preview_rect =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(120.0, 18.0));
+
+        assert!(pointer_hits_search_preview(
+            Some(preview_rect.center()),
+            preview_rect
+        ));
+        assert!(!pointer_hits_search_preview(
+            Some(egui::pos2(
+                preview_rect.right() + 1.0,
+                preview_rect.center().y
+            )),
+            preview_rect
+        ));
+        assert!(!pointer_hits_search_preview(None, preview_rect));
+    }
+
+    #[test]
+    fn jumping_to_search_hit_selects_its_editor_line() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "prefix needle suffix").unwrap();
+        writeln!(file, "second").unwrap();
+        file.flush().unwrap();
+
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        view.select_search_hit(7, 3);
+        view.jump_to_hit(SearchHit {
+            byte_start: 7,
+            byte_end: 13,
+        });
+
+        assert_eq!(view.selected_search_hit, Some((7, 3)));
+        assert_eq!(view.selected_editor_line, Some(0));
+        assert_eq!(view.selection_surface, SelectionSurface::Editor);
+        assert!(!view.editor_select_all);
     }
 
     #[test]
