@@ -1,11 +1,14 @@
-use crate::{FileSnapshot, FileSource, IndexOptions, Result, index::IndexState};
+use crate::{
+    FileSnapshot, FileSource, IndexOptions, Result,
+    index::{IndexState, IndexWorker},
+};
 use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
 
 #[derive(Debug)]
 pub struct TextDocument {
     source: Arc<FileSource>,
     index: RwLock<IndexState>,
-    index_step: Mutex<()>,
+    index_step: Mutex<IndexWorker>,
     index_running: AtomicBool,
     index_cancel: AtomicBool,
 }
@@ -24,7 +27,7 @@ impl TextDocument {
         Ok(Arc::new(Self {
             source,
             index: RwLock::new(IndexState::new(index_options)),
-            index_step: Mutex::new(()),
+            index_step: Mutex::new(IndexWorker::default()),
             index_running: AtomicBool::new(false),
             index_cancel: AtomicBool::new(false),
         }))
@@ -50,7 +53,7 @@ impl TextDocument {
         &self.index
     }
 
-    pub(crate) fn index_step_lock(&self) -> &Mutex<()> {
+    pub(crate) fn index_step_lock(&self) -> &Mutex<IndexWorker> {
         &self.index_step
     }
 

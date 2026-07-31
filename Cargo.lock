@@ -1798,7 +1798,9 @@ dependencies = [
  "eframe",
  "embed-resource",
  "nkg-text-engine",
+ "quick-xml",
  "rfd",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1811,6 +1813,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.19",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

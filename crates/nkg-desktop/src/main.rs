@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod edit;
+mod json;
 mod theme;
+mod xml;
 
 use app::NkgApp;
 use eframe::egui;

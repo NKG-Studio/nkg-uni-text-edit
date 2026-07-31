@@ -10,10 +10,10 @@ use std::{
     },
 };
 
-const DEFAULT_SEARCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_SEARCH_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_SEARCH_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEARCH_PATTERN_BYTES: usize = 1024 * 1024;
-const SEARCH_HIT_RECORD_BYTES: usize = 16;
+const SEARCH_HIT_RECORD_BYTES: usize = 8;
 const MAX_SEARCH_HIT_PAGE: usize = 10_000;
 const SEARCH_HIT_WRITE_BATCH: usize = 4_096;
 
@@ -137,13 +137,22 @@ pub struct SearchAllResult {
 
 /// 磁盘分页的完整搜索命中表。
 ///
-/// 每条命中固定占用 16 字节，只保存绝对字节范围；结果文本由 UI 按可见区域从原文件读取。
+/// 每条命中固定占用 8 字节，只保存绝对起始位置；同一次字面量搜索的模式长度单独保存。
+/// 结果文本由 UI 按可见区域从原文件读取。
 /// 临时文件会在结果表释放时自动删除。
 #[derive(Debug)]
 pub struct SearchHitStore {
-    temporary: Mutex<tempfile::NamedTempFile>,
+    writer: Mutex<SearchHitWriter>,
     reader: File,
     hit_count: AtomicU64,
+    pattern_len: AtomicU64,
+    claimed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SearchHitWriter {
+    temporary: tempfile::NamedTempFile,
+    encoded: Vec<u8>,
 }
 
 impl SearchHitStore {
@@ -162,9 +171,14 @@ impl SearchHitStore {
             .try_clone()
             .map_err(|source| EngineError::FileIo { path, source })?;
         Ok(Self {
-            temporary: Mutex::new(temporary),
+            writer: Mutex::new(SearchHitWriter {
+                temporary,
+                encoded: Vec::with_capacity(SEARCH_HIT_WRITE_BATCH * SEARCH_HIT_RECORD_BYTES),
+            }),
             reader,
             hit_count: AtomicU64::new(0),
+            pattern_len: AtomicU64::new(0),
+            claimed: AtomicBool::new(false),
         })
     }
 
@@ -175,6 +189,21 @@ impl SearchHitStore {
     pub fn disk_bytes(&self) -> u64 {
         self.hit_count()
             .saturating_mul(SEARCH_HIT_RECORD_BYTES as u64)
+    }
+
+    fn claim(&self, pattern_len: usize) -> Result<()> {
+        if self
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(EngineError::InvalidArgument(
+                "SearchHitStore 已被使用；每次搜索请创建新结果表".into(),
+            ));
+        }
+        self.pattern_len
+            .store(pattern_len as u64, Ordering::Release);
+        Ok(())
     }
 
     pub fn read_page(&self, start: u64, limit: usize) -> Result<Vec<SearchHit>> {
@@ -193,48 +222,68 @@ impl SearchHitStore {
             .ok_or_else(|| EngineError::InvalidArgument("搜索结果偏移溢出".into()))?;
         let mut bytes = vec![0_u8; record_count * SEARCH_HIT_RECORD_BYTES];
         let path = self
-            .temporary
+            .writer
             .lock()
             .expect("search hit store poisoned")
+            .temporary
             .path()
             .to_path_buf();
-        let bytes_read = positional_read(&self.reader, byte_offset, &mut bytes)
-            .map_err(|source| EngineError::FileIo { path, source })?;
+        let mut bytes_read = 0_usize;
+        while bytes_read < bytes.len() {
+            let read = positional_read(
+                &self.reader,
+                byte_offset + bytes_read as u64,
+                &mut bytes[bytes_read..],
+            )
+            .map_err(|source| EngineError::FileIo {
+                path: path.clone(),
+                source,
+            })?;
+            if read == 0 {
+                break;
+            }
+            bytes_read += read;
+        }
         bytes.truncate((bytes_read / SEARCH_HIT_RECORD_BYTES) * SEARCH_HIT_RECORD_BYTES);
 
+        let pattern_len = self.pattern_len.load(Ordering::Acquire);
         Ok(bytes
             .chunks_exact(SEARCH_HIT_RECORD_BYTES)
-            .map(|record| SearchHit {
-                byte_start: u64::from_le_bytes(record[..8].try_into().expect("8-byte start")),
-                byte_end: u64::from_le_bytes(record[8..].try_into().expect("8-byte end")),
+            .map(|record| {
+                let byte_start = u64::from_le_bytes(record.try_into().expect("8-byte start"));
+                SearchHit {
+                    byte_start,
+                    byte_end: byte_start.saturating_add(pattern_len),
+                }
             })
             .collect())
     }
 
-    fn append_batch(&self, hits: &[SearchHit]) -> Result<()> {
-        if hits.is_empty() {
+    fn append_batch(&self, starts: &[u64]) -> Result<()> {
+        if starts.is_empty() {
             return Ok(());
         }
-        let mut bytes = Vec::with_capacity(hits.len() * SEARCH_HIT_RECORD_BYTES);
-        for hit in hits {
-            bytes.extend_from_slice(&hit.byte_start.to_le_bytes());
-            bytes.extend_from_slice(&hit.byte_end.to_le_bytes());
+        let mut writer = self.writer.lock().expect("search hit store poisoned");
+        writer.encoded.clear();
+        for start in starts {
+            writer.encoded.extend_from_slice(&start.to_le_bytes());
         }
-        let mut temporary = self.temporary.lock().expect("search hit store poisoned");
-        let path = temporary.path().to_path_buf();
+        let path = writer.temporary.path().to_path_buf();
+        let SearchHitWriter { temporary, encoded } = &mut *writer;
         temporary
             .as_file_mut()
-            .write_all(&bytes)
+            .write_all(encoded)
             .map_err(|source| EngineError::FileIo { path, source })?;
         self.hit_count
-            .fetch_add(hits.len() as u64, Ordering::Release);
+            .fetch_add(starts.len() as u64, Ordering::Release);
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
-        let mut temporary = self.temporary.lock().expect("search hit store poisoned");
-        let path = temporary.path().to_path_buf();
-        temporary
+        let mut writer = self.writer.lock().expect("search hit store poisoned");
+        let path = writer.temporary.path().to_path_buf();
+        writer
+            .temporary
             .as_file_mut()
             .flush()
             .map_err(|source| EngineError::FileIo { path, source })
@@ -270,8 +319,9 @@ impl TextDocument {
             .build([pattern])
             .map_err(|error| EngineError::SearchPattern(error.to_string()))?;
 
+        let chunk_bytes = options.chunk_bytes.max(pattern.len());
         let overlap = pattern.len().saturating_sub(1);
-        let mut buffer = vec![0_u8; options.chunk_bytes + overlap];
+        let mut buffer = vec![0_u8; chunk_bytes + overlap];
         let mut carry_len = 0_usize;
         let mut cursor = options.start_offset;
         let mut hits = Vec::with_capacity(options.max_results.min(1_024));
@@ -284,7 +334,7 @@ impl TextDocument {
                 break;
             }
 
-            let remaining = (end_offset - cursor).min(options.chunk_bytes as u64) as usize;
+            let remaining = (end_offset - cursor).min(chunk_bytes as u64) as usize;
             let bytes_read = self
                 .source()
                 .read_at(cursor, &mut buffer[carry_len..carry_len + remaining])?;
@@ -328,6 +378,9 @@ impl TextDocument {
             }
         }
 
+        if !cancelled {
+            self.source().ensure_unchanged()?;
+        }
         Ok(SearchResult {
             hits,
             scanned_bytes: cursor - options.start_offset,
@@ -349,11 +402,6 @@ impl TextDocument {
     where
         F: FnMut(SearchAllProgress),
     {
-        if store.hit_count() != 0 {
-            return Err(EngineError::InvalidArgument(
-                "SearchHitStore 必须为空；每次搜索请创建新结果表".into(),
-            ));
-        }
         let validated = SearchOptions {
             start_offset: options.start_offset,
             end_offset: options.end_offset,
@@ -368,22 +416,24 @@ impl TextDocument {
             .match_kind(MatchKind::Standard)
             .build([pattern])
             .map_err(|error| EngineError::SearchPattern(error.to_string()))?;
+        store.claim(pattern.len())?;
 
+        let chunk_bytes = validated.chunk_bytes.max(pattern.len());
         let overlap = pattern.len().saturating_sub(1);
-        let mut buffer = vec![0_u8; validated.chunk_bytes + overlap];
+        let mut buffer = vec![0_u8; chunk_bytes + overlap];
         let mut carry_len = 0_usize;
         let mut cursor = validated.start_offset;
         let mut hit_count = 0_u64;
-        let mut pending_hits = Vec::with_capacity(SEARCH_HIT_WRITE_BATCH);
+        let mut pending_starts = Vec::with_capacity(SEARCH_HIT_WRITE_BATCH);
         let mut cancelled = false;
 
-        while cursor < end_offset {
+        'scan: while cursor < end_offset {
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
             }
 
-            let remaining = (end_offset - cursor).min(validated.chunk_bytes as u64) as usize;
+            let remaining = (end_offset - cursor).min(chunk_bytes as u64) as usize;
             let bytes_read = self
                 .source()
                 .read_at(cursor, &mut buffer[carry_len..carry_len + remaining])?;
@@ -399,21 +449,23 @@ impl TextDocument {
                 if absolute_end <= cursor || absolute_start < validated.start_offset {
                     continue;
                 }
-                pending_hits.push(SearchHit {
-                    byte_start: absolute_start,
-                    byte_end: absolute_end,
-                });
+                pending_starts.push(absolute_start);
                 hit_count = hit_count
                     .checked_add(1)
                     .ok_or_else(|| EngineError::InvalidArgument("搜索命中数量溢出 u64".into()))?;
-                if pending_hits.len() >= SEARCH_HIT_WRITE_BATCH {
-                    store.append_batch(&pending_hits)?;
-                    pending_hits.clear();
+                if pending_starts.len() >= SEARCH_HIT_WRITE_BATCH {
+                    store.append_batch(&pending_starts)?;
+                    pending_starts.clear();
+                    if cancel.load(Ordering::Relaxed) {
+                        cursor = absolute_end.min(end_offset);
+                        cancelled = true;
+                        break 'scan;
+                    }
                 }
             }
 
-            store.append_batch(&pending_hits)?;
-            pending_hits.clear();
+            store.append_batch(&pending_starts)?;
+            pending_starts.clear();
             cursor += bytes_read as u64;
             on_progress(SearchAllProgress {
                 scanned_bytes: cursor - validated.start_offset,
@@ -427,8 +479,11 @@ impl TextDocument {
             }
         }
 
-        store.append_batch(&pending_hits)?;
+        store.append_batch(&pending_starts)?;
         store.flush()?;
+        if !cancelled {
+            self.source().ensure_unchanged()?;
+        }
         Ok(SearchAllResult {
             hit_count,
             scanned_bytes: cursor - validated.start_offset,

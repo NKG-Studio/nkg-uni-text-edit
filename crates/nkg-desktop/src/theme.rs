@@ -16,6 +16,12 @@ pub const STATUS: Color32 = SELECTION;
 pub const DIFF_REPLACE: Color32 = Color32::from_rgb(63, 57, 25);
 pub const DIFF_DELETE: Color32 = Color32::from_rgb(64, 35, 35);
 pub const DIFF_INSERT: Color32 = Color32::from_rgb(33, 58, 38);
+pub const WARNING: Color32 = Color32::from_rgb(220, 180, 80);
+pub const ERROR: Color32 = Color32::from_rgb(244, 135, 113);
+pub const JSON_KEY: Color32 = Color32::from_rgb(156, 220, 254);
+pub const JSON_STRING: Color32 = Color32::from_rgb(206, 145, 120);
+pub const JSON_NUMBER: Color32 = Color32::from_rgb(181, 206, 168);
+pub const JSON_LITERAL: Color32 = Color32::from_rgb(86, 156, 214);
 
 pub fn configure(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);

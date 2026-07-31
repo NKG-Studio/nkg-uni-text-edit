@@ -84,6 +84,25 @@ fn reads_a_bounded_window_before_an_offset_for_continuous_scrolling() {
 }
 
 #[test]
+fn backward_window_stops_after_the_requested_dense_lines() {
+    let file = temp_text(&vec![b'\n'; 1024 * 1024]);
+    let document = TextDocument::open(file.path()).unwrap();
+    let window = document
+        .read_window_before(
+            document.len(),
+            ReadWindowOptions {
+                max_bytes: 1024 * 1024,
+                max_lines: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(window.lines.len(), 4);
+    assert_eq!(window.start_offset, document.len() - 4);
+}
+
+#[test]
 fn marks_invalid_utf8_as_lossy() {
     let file = temp_text(&[b'a', 0xff, b'b', b'\n']);
     let document = TextDocument::open(file.path()).unwrap();
@@ -197,12 +216,53 @@ fn search_all_spools_every_hit_and_reads_pages() {
 
     assert_eq!(result.hit_count, 4);
     assert_eq!(store.hit_count(), 4);
-    assert_eq!(store.disk_bytes(), 64);
+    assert_eq!(store.disk_bytes(), 32);
     let page = store.read_page(1, 2).unwrap();
     assert_eq!(
         page.iter().map(|hit| hit.byte_start).collect::<Vec<_>>(),
         vec![1, 2]
     );
+}
+
+#[test]
+fn search_hit_store_can_only_be_claimed_once() {
+    let file = temp_text(b"aaaa");
+    let document = TextDocument::open(file.path()).unwrap();
+    let store = SearchHitStore::create().unwrap();
+    let cancel = AtomicBool::new(false);
+    document
+        .search_literal_all(b"a", SearchAllOptions::default(), &store, &cancel, |_| {})
+        .unwrap();
+
+    let error = document
+        .search_literal_all(b"a", SearchAllOptions::default(), &store, &cancel, |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("已被使用"));
+}
+
+#[test]
+fn a_large_pattern_uses_a_safe_effective_chunk_size() {
+    let pattern = vec![b'x'; 4096];
+    let mut source = vec![b'a'; 17];
+    source.extend_from_slice(&pattern);
+    source.push(b'z');
+    let file = temp_text(&source);
+    let document = TextDocument::open(file.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let result = document
+        .search_literal(
+            &pattern,
+            SearchOptions {
+                chunk_bytes: 1,
+                ..Default::default()
+            },
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].byte_start, 17);
 }
 
 #[test]
@@ -325,9 +385,41 @@ fn visible_window_diff_detects_line_ending_changes() {
 }
 
 #[test]
+fn identical_windows_skip_the_lcs_matrix() {
+    let file = temp_text(b"one\ntwo\nthree\n");
+    let document = TextDocument::open(file.path()).unwrap();
+    let window = document
+        .read_window(0, ReadWindowOptions::default())
+        .unwrap();
+
+    let summary =
+        compare_text_windows(&window, &window, WindowDiffOptions { max_cells: 1 }).unwrap();
+    assert_eq!(summary.matrix_cells, 1);
+    assert_eq!(summary.runs.len(), 1);
+    assert_eq!(summary.runs[0].kind, WindowDiffKind::Equal);
+}
+
+#[test]
+fn visible_window_diff_distinguishes_lossy_utf8_bytes() {
+    let left_file = temp_text(&[0xff, b'\n']);
+    let right_file = temp_text(&[0xfe, b'\n']);
+    let left_document = TextDocument::open(left_file.path()).unwrap();
+    let right_document = TextDocument::open(right_file.path()).unwrap();
+    let left = left_document
+        .read_window(0, ReadWindowOptions::default())
+        .unwrap();
+    let right = right_document
+        .read_window(0, ReadWindowOptions::default())
+        .unwrap();
+
+    let summary = compare_text_windows(&left, &right, WindowDiffOptions::default()).unwrap();
+    assert_eq!(summary.runs[0].kind, WindowDiffKind::Replace);
+}
+
+#[test]
 fn visible_window_diff_rejects_unbounded_matrices() {
     let left_file = temp_text(b"one\ntwo\n");
-    let right_file = temp_text(b"one\ntwo\n");
+    let right_file = temp_text(b"alpha\nbeta\n");
     let left_document = TextDocument::open(left_file.path()).unwrap();
     let right_document = TextDocument::open(right_file.path()).unwrap();
     let left = left_document
@@ -349,4 +441,35 @@ fn source_snapshot_detects_size_changes() {
     assert!(source.metadata_is_unchanged().unwrap());
     fs::write(file.path(), b"after-and-longer").unwrap();
     assert!(!source.metadata_is_unchanged().unwrap());
+    assert!(source.ensure_unchanged().is_err());
+}
+
+#[test]
+fn indexing_rejects_a_source_truncated_after_open() {
+    let file = temp_text(b"one\ntwo\nthree\n");
+    let document = TextDocument::open_with_index_options(
+        file.path(),
+        IndexOptions {
+            chunk_bytes: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fs::write(file.path(), b"short").unwrap();
+
+    let error = document.index_next().unwrap_err();
+    assert!(error.to_string().contains("发生变化"));
+}
+
+#[test]
+fn searching_rejects_a_source_changed_after_open() {
+    let file = temp_text(b"needle before change");
+    let document = TextDocument::open(file.path()).unwrap();
+    fs::write(file.path(), b"needle").unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let error = document
+        .search_literal(b"needle", SearchOptions::default(), &cancel, |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("发生变化"));
 }

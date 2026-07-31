@@ -1,5 +1,5 @@
 use crate::{EngineError, Result, TextDocument};
-use memchr::{memchr_iter, memrchr};
+use memchr::{memchr_iter, memrchr, memrchr_iter};
 use serde::Serialize;
 
 pub const DEFAULT_WINDOW_BYTES: usize = 256 * 1024;
@@ -8,6 +8,7 @@ pub const DEFAULT_MAX_LINES: usize = 4_096;
 pub const MAX_WINDOW_LINES: usize = 100_000;
 const BACKWARD_SCAN_BLOCK: usize = 64 * 1024;
 const DEFAULT_MAX_BACKTRACK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BACKTRACK_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowAlignment {
@@ -48,10 +49,10 @@ impl ReadWindowOptions {
                 "max_lines 必须在 1..={MAX_WINDOW_LINES} 范围内"
             )));
         }
-        if self.max_backtrack_bytes == 0 {
-            return Err(EngineError::InvalidArgument(
-                "max_backtrack_bytes 必须大于 0".into(),
-            ));
+        if self.max_backtrack_bytes == 0 || self.max_backtrack_bytes > MAX_BACKTRACK_BYTES {
+            return Err(EngineError::InvalidArgument(format!(
+                "max_backtrack_bytes 必须在 1..={MAX_BACKTRACK_BYTES} 范围内"
+            )));
         }
         Ok(self)
     }
@@ -69,9 +70,11 @@ pub struct LineSlice {
     pub prefix_truncated: bool,
     pub suffix_truncated: bool,
     pub utf8_lossy: bool,
+    #[serde(skip)]
+    pub(crate) raw_bytes: Option<Box<[u8]>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LineEnding {
     None,
@@ -111,26 +114,41 @@ impl TextDocument {
         let mut buffer = vec![0_u8; scan_bytes];
         let bytes_read = self.source().read_at(scan_start, &mut buffer)?;
         buffer.truncate(bytes_read);
-        let newline_offsets: Vec<_> = memchr_iter(b'\n', &buffer).collect();
         let trailing_partial_line = usize::from(buffer.last() != Some(&b'\n'));
-        let boundary_index = newline_offsets
-            .len()
-            .saturating_add(trailing_partial_line)
-            .checked_sub(options.max_lines.saturating_add(1));
-        let start_offset = if let Some(boundary_index) = boundary_index {
-            let boundary = newline_offsets[boundary_index];
-            scan_start + boundary as u64 + 1
-        } else {
-            scan_start
-        };
-
-        self.read_window(
+        let boundary_from_end = options.max_lines.saturating_sub(trailing_partial_line);
+        let start_offset =
+            if let Some(boundary) = memrchr_iter(b'\n', &buffer).nth(boundary_from_end) {
+                scan_start + boundary as u64 + 1
+            } else {
+                scan_start
+            };
+        let start_index = (start_offset - scan_start) as usize;
+        let retained = buffer.len().saturating_sub(start_index);
+        buffer.copy_within(start_index.., 0);
+        buffer.truncate(retained);
+        let forward_offset = scan_start + bytes_read as u64;
+        let forward_bytes = options.max_bytes.saturating_sub(retained).min(
+            self.len()
+                .saturating_sub(forward_offset)
+                .min(options.max_bytes as u64) as usize,
+        );
+        if forward_bytes > 0 {
+            buffer.resize(retained + forward_bytes, 0);
+            let extra = self
+                .source()
+                .read_at(forward_offset, &mut buffer[retained..])?;
+            buffer.truncate(retained + extra);
+        }
+        let starts_mid_line = !self.is_line_start(start_offset)?;
+        let window = self.build_text_window(
             start_offset,
-            ReadWindowOptions {
-                alignment: WindowAlignment::Exact,
-                ..options
-            },
-        )
+            start_offset,
+            starts_mid_line,
+            options,
+            &buffer,
+        )?;
+        self.source().ensure_unchanged()?;
+        Ok(window)
     }
 
     pub fn read_window(
@@ -140,20 +158,8 @@ impl TextDocument {
     ) -> Result<TextWindow> {
         let options = options.validate()?;
         let requested_offset = requested_offset.min(self.len());
-        let (start_offset, backtrack_truncated) = match options.alignment {
-            WindowAlignment::Exact => (requested_offset, false),
-            WindowAlignment::ContainingLine => {
-                self.find_line_start(requested_offset, options.max_backtrack_bytes)?
-            }
-        };
-        let starts_on_line = self.is_line_start(start_offset)?;
-        let starts_mid_line = backtrack_truncated || !starts_on_line;
-
-        let mut buffer = vec![0_u8; options.max_bytes];
-        let bytes_read = self.source().read_at(start_offset, &mut buffer)?;
-        buffer.truncate(bytes_read);
-
         if self.is_empty() {
+            self.source().ensure_unchanged()?;
             return Ok(TextWindow {
                 requested_offset,
                 start_offset: 0,
@@ -171,10 +177,43 @@ impl TextDocument {
                     prefix_truncated: false,
                     suffix_truncated: false,
                     utf8_lossy: false,
+                    raw_bytes: None,
                 }],
             });
         }
+        let (start_offset, backtrack_truncated) = match options.alignment {
+            WindowAlignment::Exact => (requested_offset, false),
+            WindowAlignment::ContainingLine => {
+                self.find_line_start(requested_offset, options.max_backtrack_bytes)?
+            }
+        };
+        let starts_on_line = self.is_line_start(start_offset)?;
+        let starts_mid_line = backtrack_truncated || !starts_on_line;
 
+        let read_bytes = (self.len() - start_offset).min(options.max_bytes as u64) as usize;
+        let mut buffer = vec![0_u8; read_bytes];
+        let bytes_read = self.source().read_at(start_offset, &mut buffer)?;
+        buffer.truncate(bytes_read);
+
+        let window = self.build_text_window(
+            requested_offset,
+            start_offset,
+            starts_mid_line,
+            options,
+            &buffer,
+        )?;
+        self.source().ensure_unchanged()?;
+        Ok(window)
+    }
+
+    fn build_text_window(
+        &self,
+        requested_offset: u64,
+        start_offset: u64,
+        starts_mid_line: bool,
+        options: ReadWindowOptions,
+        buffer: &[u8],
+    ) -> Result<TextWindow> {
         let first_line_number = if starts_mid_line {
             None
         } else {
@@ -186,7 +225,7 @@ impl TextDocument {
         let mut next_offset = start_offset;
         let mut line_number = first_line_number;
 
-        for newline_index in memchr_iter(b'\n', &buffer) {
+        for newline_index in memchr_iter(b'\n', buffer) {
             if lines.len() >= options.max_lines {
                 break;
             }
@@ -202,18 +241,20 @@ impl TextDocument {
             };
             let bytes = &buffer[content_start..text_end];
             let decoded = String::from_utf8_lossy(bytes);
+            let utf8_lossy = matches!(&decoded, std::borrow::Cow::Owned(_));
             let byte_start = start_offset + content_start as u64;
             let byte_end = start_offset + newline_index as u64 + 1;
             lines.push(LineSlice {
                 byte_start,
                 byte_end,
-                text: decoded.to_string(),
+                text: decoded.into_owned(),
                 line_number,
                 has_line_ending: true,
                 line_ending,
                 prefix_truncated: lines.is_empty() && starts_mid_line,
                 suffix_truncated: false,
-                utf8_lossy: matches!(decoded, std::borrow::Cow::Owned(_)),
+                utf8_lossy,
+                raw_bytes: utf8_lossy.then(|| bytes.to_vec().into_boxed_slice()),
             });
             next_offset = byte_end;
             content_start = newline_index + 1;
@@ -224,19 +265,21 @@ impl TextDocument {
         if !stopped_for_line_limit && content_start < buffer.len() {
             let bytes = &buffer[content_start..];
             let decoded = String::from_utf8_lossy(bytes);
+            let utf8_lossy = matches!(&decoded, std::borrow::Cow::Owned(_));
             let byte_start = start_offset + content_start as u64;
             let byte_end = start_offset + buffer.len() as u64;
             let suffix_truncated = byte_end < self.len();
             lines.push(LineSlice {
                 byte_start,
                 byte_end,
-                text: decoded.to_string(),
+                text: decoded.into_owned(),
                 line_number,
                 has_line_ending: false,
                 line_ending: LineEnding::None,
                 prefix_truncated: lines.is_empty() && starts_mid_line,
                 suffix_truncated,
-                utf8_lossy: matches!(decoded, std::borrow::Cow::Owned(_)),
+                utf8_lossy,
+                raw_bytes: utf8_lossy.then(|| bytes.to_vec().into_boxed_slice()),
             });
             next_offset = byte_end;
         } else if !stopped_for_line_limit && content_start == buffer.len() {
@@ -255,6 +298,7 @@ impl TextDocument {
                     prefix_truncated: false,
                     suffix_truncated: false,
                     utf8_lossy: false,
+                    raw_bytes: None,
                 });
             }
         }

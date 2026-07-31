@@ -7,15 +7,17 @@ mod source;
 mod window;
 
 pub use diff::{
-    BlockDiffKind, BlockDiffOptions, BlockDiffRun, BlockDiffSummary, WindowDiffKind,
-    WindowDiffOptions, WindowDiffRun, WindowDiffSummary, compare_blocks, compare_text_windows,
+    BlockDiffKind, BlockDiffOptions, BlockDiffRun, BlockDiffSummary, DEFAULT_DIFF_BLOCK_BYTES,
+    WindowDiffKind, WindowDiffOptions, WindowDiffRun, WindowDiffSummary, compare_blocks,
+    compare_text_windows,
 };
 pub use document::TextDocument;
 pub use error::{EngineError, Result};
 pub use index::{IndexOptions, IndexStatus, LineCheckpoint};
 pub use search::{
-    CaseSensitivity, HighlightSpan, SearchAllOptions, SearchAllProgress, SearchAllResult,
-    SearchHit, SearchHitStore, SearchOptions, SearchProgress, SearchResult, highlights_for_window,
+    CaseSensitivity, DEFAULT_SEARCH_CHUNK_BYTES, HighlightSpan, SearchAllOptions,
+    SearchAllProgress, SearchAllResult, SearchHit, SearchHitStore, SearchOptions, SearchProgress,
+    SearchResult, highlights_for_window,
 };
 pub use source::{FileSnapshot, FileSource};
 pub use window::{

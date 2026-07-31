@@ -70,6 +70,24 @@ impl IndexState {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct IndexWorker {
+    pub buffer: Vec<u8>,
+    pub checkpoints: Vec<LineCheckpoint>,
+}
+
+impl std::fmt::Debug for IndexWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexWorker")
+            .field("buffer_len", &self.buffer.len())
+            .field("buffer_capacity", &self.buffer.capacity())
+            .field("checkpoint_scratch_len", &self.checkpoints.len())
+            .field("checkpoint_scratch_capacity", &self.checkpoints.capacity())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
@@ -96,47 +114,61 @@ impl TextDocument {
 
     /// 执行一个有界索引步骤。返回 `true` 表示索引已经完成。
     pub fn index_next(&self) -> Result<bool> {
-        let _step = self.index_step_lock().lock().expect("index step poisoned");
-        let (start, chunk_bytes) = {
+        let mut worker = self.index_step_lock().lock().expect("index step poisoned");
+        let (start, options, mut current_line, mut last_checkpoint) = {
             let state = self.index_state().read().expect("line index poisoned");
             if state.indexed_bytes >= self.len() {
+                self.source().ensure_unchanged()?;
                 return Ok(true);
             }
-            (state.indexed_bytes, state.options.chunk_bytes)
+            (
+                state.indexed_bytes,
+                state.options,
+                state.current_line,
+                *state
+                    .checkpoints
+                    .last()
+                    .expect("line index always has origin checkpoint"),
+            )
         };
 
-        let mut buffer = vec![0_u8; chunk_bytes];
-        let bytes_read = self.source().read_at(start, &mut buffer)?;
-        buffer.truncate(bytes_read);
+        worker.buffer.resize(options.chunk_bytes, 0);
+        let bytes_read = self.source().read_at(start, &mut worker.buffer)?;
+        worker.checkpoints.clear();
+        {
+            let IndexWorker {
+                buffer,
+                checkpoints,
+            } = &mut *worker;
+            for index in memchr_iter(b'\n', &buffer[..bytes_read]) {
+                current_line += 1;
+                let byte_offset = start + index as u64 + 1;
+                if current_line - last_checkpoint.line_number >= options.line_stride
+                    || byte_offset - last_checkpoint.byte_offset >= options.byte_stride
+                {
+                    last_checkpoint = LineCheckpoint {
+                        byte_offset,
+                        line_number: current_line,
+                    };
+                    checkpoints.push(last_checkpoint);
+                }
+            }
+        }
 
         let mut state = self.index_state().write().expect("line index poisoned");
         if state.indexed_bytes != start {
             return Ok(state.indexed_bytes >= self.len());
         }
-
-        for index in memchr_iter(b'\n', &buffer) {
-            state.current_line += 1;
-            let byte_offset = start + index as u64 + 1;
-            let last = *state
-                .checkpoints
-                .last()
-                .expect("line index always has origin checkpoint");
-            if state.current_line - last.line_number >= state.options.line_stride
-                || byte_offset - last.byte_offset >= state.options.byte_stride
-            {
-                let line_number = state.current_line;
-                state.checkpoints.push(LineCheckpoint {
-                    byte_offset,
-                    line_number,
-                });
-            }
-        }
-
+        state.checkpoints.extend_from_slice(&worker.checkpoints);
+        state.current_line = current_line;
         state.indexed_bytes = start + bytes_read as u64;
         let complete = bytes_read == 0 || state.indexed_bytes >= self.len();
         if complete {
+            self.source().ensure_unchanged()?;
             state.indexed_bytes = self.len();
             state.total_lines = Some(state.current_line);
+            worker.buffer = Vec::new();
+            worker.checkpoints = Vec::new();
         }
         Ok(complete)
     }
@@ -203,10 +235,13 @@ impl TextDocument {
         if distance > max_scan_bytes as u64 {
             return Ok(None);
         }
+        if distance == 0 {
+            return Ok(Some(checkpoint.line_number));
+        }
 
         let mut cursor = checkpoint.byte_offset;
         let mut line = checkpoint.line_number;
-        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; usize::try_from(distance.min(64 * 1024)).unwrap_or(64 * 1024)];
         while cursor < offset {
             let remaining = (offset - cursor).min(buffer.len() as u64) as usize;
             let bytes_read = self.source().read_at(cursor, &mut buffer[..remaining])?;

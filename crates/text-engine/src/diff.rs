@@ -1,11 +1,12 @@
-use crate::{EngineError, FileSource, LineSlice, Result, TextWindow};
+use crate::{EngineError, FileSource, LineEnding, LineSlice, Result, TextWindow};
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-const DEFAULT_DIFF_BLOCK_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_DIFF_BLOCK_BYTES: usize = 256 * 1024;
 const MAX_DIFF_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_DIFF_MAX_REGIONS: usize = 50_000;
 const MAX_DIFF_REGIONS: usize = 1_000_000;
@@ -120,6 +121,24 @@ where
             "diff max_regions 必须在 2..={MAX_DIFF_REGIONS} 范围内"
         )));
     }
+    if left.path() == right.path() && left.len() == right.len() {
+        left.ensure_unchanged()?;
+        right.ensure_unchanged()?;
+        let runs = (!left.is_empty())
+            .then(|| BlockDiffRun {
+                kind: BlockDiffKind::Equal,
+                left: 0..left.len(),
+                right: 0..right.len(),
+            })
+            .into_iter()
+            .collect();
+        return Ok(BlockDiffSummary {
+            runs,
+            compared_bytes: left.len(),
+            effective_region_bytes: left.len().max(1),
+            cancelled: false,
+        });
+    }
 
     let mut left_buffer = vec![0_u8; options.block_bytes];
     let mut right_buffer = vec![0_u8; options.block_bytes];
@@ -157,6 +176,11 @@ where
             different |= left_buffer[..actual] != right_buffer[..actual];
             cursor += actual as u64;
             on_progress(cursor, total);
+            if different && cursor < region_end {
+                cursor = region_end;
+                on_progress(cursor, total);
+                break;
+            }
         }
 
         if cursor > region_start {
@@ -173,6 +197,8 @@ where
     }
 
     if !cancelled && cursor >= common_len {
+        left.ensure_unchanged()?;
+        right.ensure_unchanged()?;
         if left.len() > common_len {
             push_or_merge(
                 &mut runs,
@@ -221,14 +247,30 @@ pub fn compare_text_windows(
         )));
     }
 
-    let rows = left
-        .lines
-        .len()
+    let (left_ids, right_ids) = intern_line_ids(&left.lines, &right.lines);
+    let mut common_prefix = 0_usize;
+    while common_prefix < left_ids.len()
+        && common_prefix < right_ids.len()
+        && left_ids[common_prefix] == right_ids[common_prefix]
+    {
+        common_prefix += 1;
+    }
+    let mut common_suffix = 0_usize;
+    while common_suffix < left_ids.len().saturating_sub(common_prefix)
+        && common_suffix < right_ids.len().saturating_sub(common_prefix)
+        && left_ids[left_ids.len() - common_suffix - 1]
+            == right_ids[right_ids.len() - common_suffix - 1]
+    {
+        common_suffix += 1;
+    }
+    let left_middle_end = left_ids.len() - common_suffix;
+    let right_middle_end = right_ids.len() - common_suffix;
+    let left_middle_len = left_middle_end - common_prefix;
+    let right_middle_len = right_middle_end - common_prefix;
+    let rows = left_middle_len
         .checked_add(1)
         .ok_or_else(|| EngineError::InvalidArgument("左侧窗口行数溢出".into()))?;
-    let columns = right
-        .lines
-        .len()
+    let columns = right_middle_len
         .checked_add(1)
         .ok_or_else(|| EngineError::InvalidArgument("右侧窗口行数溢出".into()))?;
     let cells = rows
@@ -242,31 +284,42 @@ pub fn compare_text_windows(
     }
 
     let mut lcs = vec![0_u32; cells];
-    for left_index in (0..left.lines.len()).rev() {
-        for right_index in (0..right.lines.len()).rev() {
+    for left_index in (0..left_middle_len).rev() {
+        for right_index in (0..right_middle_len).rev() {
             let cell = left_index * columns + right_index;
-            lcs[cell] = if lines_equal(&left.lines[left_index], &right.lines[right_index]) {
-                lcs[(left_index + 1) * columns + right_index + 1] + 1
-            } else {
-                lcs[(left_index + 1) * columns + right_index]
-                    .max(lcs[left_index * columns + right_index + 1])
-            };
+            lcs[cell] =
+                if left_ids[common_prefix + left_index] == right_ids[common_prefix + right_index] {
+                    lcs[(left_index + 1) * columns + right_index + 1] + 1
+                } else {
+                    lcs[(left_index + 1) * columns + right_index]
+                        .max(lcs[left_index * columns + right_index + 1])
+                };
         }
     }
 
     let mut runs = Vec::new();
-    let mut left_index = 0;
-    let mut right_index = 0;
-    while left_index < left.lines.len() || right_index < right.lines.len() {
-        if left_index < left.lines.len()
-            && right_index < right.lines.len()
-            && lines_equal(&left.lines[left_index], &right.lines[right_index])
+    if common_prefix > 0 {
+        push_window_run(
+            &mut runs,
+            WindowDiffKind::Equal,
+            0..common_prefix,
+            0..common_prefix,
+            left,
+            right,
+        );
+    }
+    let mut left_index = common_prefix;
+    let mut right_index = common_prefix;
+    while left_index < left_middle_end || right_index < right_middle_end {
+        if left_index < left_middle_end
+            && right_index < right_middle_end
+            && left_ids[left_index] == right_ids[right_index]
         {
             let left_start = left_index;
             let right_start = right_index;
-            while left_index < left.lines.len()
-                && right_index < right.lines.len()
-                && lines_equal(&left.lines[left_index], &right.lines[right_index])
+            while left_index < left_middle_end
+                && right_index < right_middle_end
+                && left_ids[left_index] == right_ids[right_index]
             {
                 left_index += 1;
                 right_index += 1;
@@ -284,22 +337,24 @@ pub fn compare_text_windows(
 
         let left_start = left_index;
         let right_start = right_index;
-        while left_index < left.lines.len() && right_index < right.lines.len() {
-            if lines_equal(&left.lines[left_index], &right.lines[right_index]) {
+        while left_index < left_middle_end && right_index < right_middle_end {
+            if left_ids[left_index] == right_ids[right_index] {
                 break;
             }
-            let skip_left = lcs[(left_index + 1) * columns + right_index];
-            let skip_right = lcs[left_index * columns + right_index + 1];
+            let relative_left = left_index - common_prefix;
+            let relative_right = right_index - common_prefix;
+            let skip_left = lcs[(relative_left + 1) * columns + relative_right];
+            let skip_right = lcs[relative_left * columns + relative_right + 1];
             if skip_left >= skip_right {
                 left_index += 1;
             } else {
                 right_index += 1;
             }
         }
-        if left_index == left.lines.len() {
-            right_index = right.lines.len();
-        } else if right_index == right.lines.len() {
-            left_index = left.lines.len();
+        if left_index == left_middle_end {
+            right_index = right_middle_end;
+        } else if right_index == right_middle_end {
+            left_index = left_middle_end;
         }
 
         let kind = match (left_index > left_start, right_index > right_start) {
@@ -317,6 +372,16 @@ pub fn compare_text_windows(
             right,
         );
     }
+    if common_suffix > 0 {
+        push_window_run(
+            &mut runs,
+            WindowDiffKind::Equal,
+            left_middle_end..left.lines.len(),
+            right_middle_end..right.lines.len(),
+            left,
+            right,
+        );
+    }
 
     Ok(WindowDiffSummary {
         runs,
@@ -326,11 +391,41 @@ pub fn compare_text_windows(
     })
 }
 
-fn lines_equal(left: &LineSlice, right: &LineSlice) -> bool {
-    left.text == right.text
-        && left.line_ending == right.line_ending
-        && left.prefix_truncated == right.prefix_truncated
-        && left.suffix_truncated == right.suffix_truncated
+type LineKey<'a> = (&'a str, LineEnding, bool, bool, bool, Option<&'a [u8]>);
+
+fn intern_line_id<'a>(
+    line: &'a LineSlice,
+    ids: &mut HashMap<LineKey<'a>, u32>,
+    next_id: &mut u32,
+) -> u32 {
+    let key = (
+        line.text.as_str(),
+        line.line_ending,
+        line.prefix_truncated,
+        line.suffix_truncated,
+        line.utf8_lossy,
+        line.raw_bytes.as_deref(),
+    );
+    *ids.entry(key).or_insert_with(|| {
+        let id = *next_id;
+        *next_id = next_id.saturating_add(1);
+        id
+    })
+}
+
+fn intern_line_ids<'a>(left: &'a [LineSlice], right: &'a [LineSlice]) -> (Vec<u32>, Vec<u32>) {
+    let mut ids: HashMap<LineKey<'a>, u32> =
+        HashMap::with_capacity(left.len().saturating_add(right.len()));
+    let mut next_id = 0_u32;
+    let left_ids = left
+        .iter()
+        .map(|line| intern_line_id(line, &mut ids, &mut next_id))
+        .collect();
+    let right_ids = right
+        .iter()
+        .map(|line| intern_line_id(line, &mut ids, &mut next_id))
+        .collect();
+    (left_ids, right_ids)
 }
 
 fn push_window_run(

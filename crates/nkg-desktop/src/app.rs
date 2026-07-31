@@ -1,4 +1,9 @@
-use crate::theme;
+use crate::{
+    edit::{LinePatch, save_patched_copy},
+    json::{JsonOutline, format_json_to_temp, scan_json_outline},
+    theme,
+    xml::{XmlOutline, canonicalize_xml_to_temp, format_xml_to_temp, scan_xml_outline},
+};
 use eframe::egui::{
     self, Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextFormat, TextStyle,
     containers::scroll_area::ScrollBarVisibility, text::LayoutJob,
@@ -12,10 +17,10 @@ use nkg_text_engine::{
     highlights_for_window,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -28,8 +33,11 @@ const DIFF_VIEW_BYTES: usize = 1024 * 1024;
 const DIFF_VIEW_LINES: usize = 1_000;
 const MAX_DISPLAY_LINE_BYTES: usize = 32 * 1024;
 const VISIBLE_HIGHLIGHT_LIMIT: usize = 10_000;
-const SEARCH_PREVIEW_CACHE_LIMIT: usize = 2_000;
-const SEARCH_PREVIEW_BYTES: usize = 64 * 1024;
+const SEARCH_PREVIEW_CACHE_LIMIT: usize = 512;
+const SEARCH_PREVIEW_BYTES: usize = 16 * 1024;
+const SEARCH_PREVIEW_LINE_SCAN_BYTES: usize = 256 * 1024;
+const MAX_SEARCH_SESSIONS: usize = 8;
+const MAX_SEARCH_RESULT_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const TITLE_BAR_CONTROL_HEIGHT: f32 = 26.0;
 const TAB_BAR_HEIGHT: f32 = 36.0;
 const TAB_HORIZONTAL_PADDING: f32 = 10.0;
@@ -53,6 +61,11 @@ const HOME_SUBTITLE_SIZE: f32 = 16.0;
 const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
+const JSON_FILTER_MAX_RESULTS: usize = 200;
+const JSON_TREE_MAX_SIBLINGS: usize = 1_000;
+const MAX_AUTO_FORMAT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_XML_OUTLINE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
 fn file_overview_thumb_height(track_height: f32, visible_lines: u64, total_lines: u64) -> f32 {
     let track_height = track_height.max(0.0);
@@ -107,9 +120,17 @@ enum SelectionSurface {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentSyntax {
+    Plain,
+    Json,
+    Xml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarMode {
     Explorer,
     Search,
+    Json,
     Compare,
 }
 
@@ -126,6 +147,134 @@ fn toggle_sidebar_mode(
     }
 }
 
+fn show_json_tree_node(
+    ui: &mut egui::Ui,
+    outline: &JsonOutline,
+    node_id: usize,
+    render_depth: usize,
+    current_selection: Option<usize>,
+    selected: &mut Option<usize>,
+) {
+    let Some(node) = outline.nodes.get(node_id) else {
+        return;
+    };
+    let label = format!("{}  {}", node.kind.icon(), outline.label(node_id));
+    if let Some(first_child) = outline.first_child(node_id)
+        && render_depth < 64
+    {
+        let response = egui::CollapsingHeader::new(label)
+            .id_salt(("json_node", node_id))
+            .default_open(render_depth == 0)
+            .show(ui, |ui| {
+                let mut child = Some(first_child);
+                let mut shown = 0_usize;
+                while let Some(child_id) = child {
+                    show_json_tree_node(
+                        ui,
+                        outline,
+                        child_id,
+                        render_depth + 1,
+                        current_selection,
+                        selected,
+                    );
+                    child = outline.next_sibling(child_id);
+                    shown += 1;
+                    if shown >= JSON_TREE_MAX_SIBLINGS {
+                        ui.label(
+                            RichText::new(format!(
+                                "该层仅显示前 {JSON_TREE_MAX_SIBLINGS} 个节点；可使用 Key 筛选"
+                            ))
+                            .small()
+                            .color(theme::MUTED),
+                        );
+                        break;
+                    }
+                }
+            });
+        if current_selection == Some(node_id) {
+            ui.painter().rect_stroke(
+                response.header_response.rect,
+                2.0,
+                egui::Stroke::new(1.0, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.header_response.clicked() {
+            *selected = Some(node_id);
+        }
+    } else if ui
+        .selectable_label(current_selection == Some(node_id), label)
+        .on_hover_text(format!("字节偏移 {}", node.byte_start))
+        .clicked()
+    {
+        *selected = Some(node_id);
+    }
+}
+
+fn show_xml_tree_node(
+    ui: &mut egui::Ui,
+    outline: &XmlOutline,
+    node_id: usize,
+    render_depth: usize,
+    current_selection: Option<usize>,
+    selected: &mut Option<usize>,
+) {
+    let Some(node) = outline.nodes.get(node_id) else {
+        return;
+    };
+    let label = format!("<>  {}", outline.label(node_id));
+    if let Some(first_child) = outline.first_child(node_id)
+        && render_depth < 64
+    {
+        let response = egui::CollapsingHeader::new(label)
+            .id_salt(("xml_node", node_id))
+            .default_open(render_depth == 0)
+            .show(ui, |ui| {
+                let mut child = Some(first_child);
+                let mut shown = 0_usize;
+                while let Some(child_id) = child {
+                    show_xml_tree_node(
+                        ui,
+                        outline,
+                        child_id,
+                        render_depth + 1,
+                        current_selection,
+                        selected,
+                    );
+                    child = outline.next_sibling(child_id);
+                    shown += 1;
+                    if shown >= JSON_TREE_MAX_SIBLINGS {
+                        ui.label(
+                            RichText::new(format!(
+                                "该层仅显示前 {JSON_TREE_MAX_SIBLINGS} 个节点；可使用名称筛选"
+                            ))
+                            .small()
+                            .color(theme::MUTED),
+                        );
+                        break;
+                    }
+                }
+            });
+        if current_selection == Some(node_id) {
+            ui.painter().rect_stroke(
+                response.header_response.rect,
+                2.0,
+                egui::Stroke::new(1.0, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.header_response.clicked() {
+            *selected = Some(node_id);
+        }
+    } else if ui
+        .selectable_label(current_selection == Some(node_id), label)
+        .on_hover_text(format!("字节偏移 {}", node.byte_start))
+        .clicked()
+    {
+        *selected = Some(node_id);
+    }
+}
+
 enum SearchEvent {
     Progress(SearchAllProgress),
     Finished(Result<SearchAllResult, String>),
@@ -135,6 +284,7 @@ struct SearchTask {
     session_id: u64,
     receiver: Receiver<SearchEvent>,
     cancel: Arc<AtomicBool>,
+    quota_reached: Arc<AtomicBool>,
 }
 
 enum BlockDiffEvent {
@@ -147,13 +297,90 @@ struct BlockDiffTask {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredDiffKind {
+    Json,
+    Xml,
+}
+
+impl StructuredDiffKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON 结构对比",
+            Self::Xml => "XML 结构对比",
+        }
+    }
+}
+
+enum StructuredPrepareEvent {
+    Progress { processed: u64, total: u64 },
+    Finished(Result<(tempfile::NamedTempFile, tempfile::NamedTempFile), String>),
+}
+
+struct StructuredPrepareTask {
+    receiver: Receiver<StructuredPrepareEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum SaveEvent {
+    Progress { source_bytes: u64, total_bytes: u64 },
+    Finished(Result<(PathBuf, u64), String>),
+}
+
+struct SaveTask {
+    receiver: Receiver<SaveEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum JsonIndexEvent {
+    Progress { scanned: u64, total: u64 },
+    Finished(Result<JsonOutline, String>),
+}
+
+struct JsonIndexTask {
+    receiver: Receiver<JsonIndexEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum JsonFormatEvent {
+    Progress { scanned: u64, total: u64 },
+    Finished(Result<(tempfile::NamedTempFile, u64), String>),
+}
+
+struct JsonFormatTask {
+    receiver: Receiver<JsonFormatEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum XmlIndexEvent {
+    Progress { scanned: u64, total: u64 },
+    Finished(Result<XmlOutline, String>),
+}
+
+struct XmlIndexTask {
+    receiver: Receiver<XmlIndexEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum XmlFormatEvent {
+    Progress { scanned: u64, total: u64 },
+    Finished(Result<(tempfile::NamedTempFile, u64), String>),
+}
+
+struct XmlFormatTask {
+    receiver: Receiver<XmlFormatEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 struct SearchPreview {
     line_number: Option<u64>,
-    text: String,
+    text: Arc<str>,
     match_range: Option<std::ops::Range<usize>>,
     byte_start: u64,
 }
+
+type SearchPreviewCache = Arc<Mutex<HashMap<u64, SearchPreview>>>;
 
 struct SearchSession {
     id: u64,
@@ -163,7 +390,7 @@ struct SearchSession {
     result: Option<SearchAllResult>,
     error: Option<String>,
     expanded: bool,
-    preview_cache: HashMap<u64, SearchPreview>,
+    preview_cache: SearchPreviewCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,6 +405,7 @@ struct SearchComparisonSource {
     document: Arc<TextDocument>,
     query: String,
     store: Arc<SearchHitStore>,
+    preview_cache: SearchPreviewCache,
 }
 
 #[derive(Clone)]
@@ -208,6 +436,15 @@ fn update_search_comparison_choice(
             right: source,
         })
     }
+}
+
+fn search_comparison_source_is_current(
+    tabs: &[DocumentView],
+    source: &SearchComparisonSource,
+) -> bool {
+    tabs.iter()
+        .find(|tab| tab.path == source.key.path)
+        .is_none_or(|tab| Arc::ptr_eq(&tab.document, &source.document))
 }
 
 #[derive(Clone, Copy)]
@@ -258,18 +495,60 @@ struct DocumentView {
     index_was_complete: bool,
     visible_row: Option<usize>,
     editor_scroll_offset: Option<f32>,
+    editor_center_offset: Option<u64>,
     editor_scroll_revision: u64,
     editor_stick_to_bottom: bool,
     editor_horizontal_offset: f32,
     editor_horizontal_drag_offset: Option<f32>,
     editor_visible_line_capacity: u64,
+    editor_row_height: f32,
     overview_estimated_total_lines: u64,
     overview_drag_offset: Option<f32>,
+    overview_drag_ratio: Option<f64>,
     selection_surface: SelectionSurface,
     selected_editor_line: Option<u64>,
     editor_select_all: bool,
     selected_search_hit: Option<(u64, u64)>,
     search_select_all: bool,
+    edit_mode: bool,
+    edits: BTreeMap<u64, LinePatch>,
+    editing_line: Option<u64>,
+    edit_buffer: String,
+    save_task: Option<SaveTask>,
+    save_progress: Option<(u64, u64)>,
+    is_json: bool,
+    json_index_started: bool,
+    json_index_task: Option<JsonIndexTask>,
+    json_index_progress: Option<(u64, u64)>,
+    json_outline: Option<JsonOutline>,
+    json_index_error: Option<String>,
+    json_filter: String,
+    json_filter_cache_query: String,
+    json_filter_matches: Vec<usize>,
+    selected_json_node: Option<usize>,
+    json_format_needed: bool,
+    json_format_started: bool,
+    json_format_task: Option<JsonFormatTask>,
+    json_format_progress: Option<(u64, u64)>,
+    json_format_error: Option<String>,
+    formatted_json_temp: Option<tempfile::NamedTempFile>,
+    is_xml: bool,
+    xml_index_started: bool,
+    xml_index_task: Option<XmlIndexTask>,
+    xml_index_progress: Option<(u64, u64)>,
+    xml_outline: Option<XmlOutline>,
+    xml_index_error: Option<String>,
+    xml_filter: String,
+    xml_filter_cache_query: String,
+    xml_filter_matches: Vec<usize>,
+    selected_xml_node: Option<usize>,
+    xml_format_needed: bool,
+    xml_format_started: bool,
+    xml_format_task: Option<XmlFormatTask>,
+    xml_format_progress: Option<(u64, u64)>,
+    xml_format_error: Option<String>,
+    formatted_xml_temp: Option<tempfile::NamedTempFile>,
+    original_file_len: u64,
 }
 
 impl DocumentView {
@@ -277,7 +556,21 @@ impl DocumentView {
         let document = TextDocument::open(&path).map_err(|error| error.to_string())?;
         let window = read_window(&document, 0)?;
         let overview_estimated_total_lines = estimate_total_lines(document.len(), &window);
-        document.start_background_index();
+        let is_json = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        let is_xml = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"));
+        let auto_format_allowed = document.len() <= MAX_AUTO_FORMAT_BYTES;
+        let json_format_needed =
+            is_json && auto_format_allowed && !document.is_empty() && window.lines.len() <= 1;
+        let xml_format_needed =
+            is_xml && auto_format_allowed && !document.is_empty() && window.lines.len() <= 1;
+        if !json_format_needed && !xml_format_needed {
+            document.start_background_index();
+        }
+        let original_file_len = document.len();
         Ok(Self {
             path,
             document,
@@ -291,22 +584,70 @@ impl DocumentView {
             next_search_session_id: 1,
             search_results_open: false,
             search_scroll_offset: None,
-            status_message: "文件已打开（只读）".into(),
+            status_message: if json_format_needed {
+                "检测到单行 JSON，准备后台格式化视图…".into()
+            } else if xml_format_needed {
+                "检测到单行 XML，准备后台格式化视图…".into()
+            } else {
+                "文件已打开（查看模式）".into()
+            },
             index_was_complete: false,
             visible_row: None,
             editor_scroll_offset: Some(0.0),
+            editor_center_offset: None,
             editor_scroll_revision: 0,
             editor_stick_to_bottom: false,
             editor_horizontal_offset: 0.0,
             editor_horizontal_drag_offset: None,
             editor_visible_line_capacity: 0,
+            editor_row_height: 20.0,
             overview_estimated_total_lines,
             overview_drag_offset: None,
+            overview_drag_ratio: None,
             selection_surface: SelectionSurface::Editor,
             selected_editor_line: None,
             editor_select_all: false,
             selected_search_hit: None,
             search_select_all: false,
+            edit_mode: false,
+            edits: BTreeMap::new(),
+            editing_line: None,
+            edit_buffer: String::new(),
+            save_task: None,
+            save_progress: None,
+            is_json,
+            json_index_started: false,
+            json_index_task: None,
+            json_index_progress: None,
+            json_outline: None,
+            json_index_error: None,
+            json_filter: String::new(),
+            json_filter_cache_query: String::new(),
+            json_filter_matches: Vec::new(),
+            selected_json_node: None,
+            json_format_needed,
+            json_format_started: false,
+            json_format_task: None,
+            json_format_progress: None,
+            json_format_error: None,
+            formatted_json_temp: None,
+            is_xml,
+            xml_index_started: false,
+            xml_index_task: None,
+            xml_index_progress: None,
+            xml_outline: None,
+            xml_index_error: None,
+            xml_filter: String::new(),
+            xml_filter_cache_query: String::new(),
+            xml_filter_matches: Vec::new(),
+            selected_xml_node: None,
+            xml_format_needed,
+            xml_format_started: false,
+            xml_format_task: None,
+            xml_format_progress: None,
+            xml_format_error: None,
+            formatted_xml_temp: None,
+            original_file_len,
         })
     }
 
@@ -317,6 +658,405 @@ impl DocumentView {
         )
     }
 
+    fn dirty(&self) -> bool {
+        !self.edits.is_empty()
+    }
+
+    fn background_active(&self) -> bool {
+        self.search_task.is_some()
+            || self.save_task.is_some()
+            || self.json_format_task.is_some()
+            || self.json_index_task.is_some()
+            || self.xml_format_task.is_some()
+            || self.xml_index_task.is_some()
+            || self.document.index_status().running
+    }
+
+    fn can_switch_to_formatted_view(&self) -> bool {
+        !self.dirty()
+            && self.save_task.is_none()
+            && self.search_task.is_none()
+            && self.search_sessions.is_empty()
+    }
+
+    fn install_formatted_document(
+        &mut self,
+        document: Arc<TextDocument>,
+        window: TextWindow,
+        temporary: tempfile::NamedTempFile,
+        is_json: bool,
+    ) {
+        self.cancel_search();
+        self.search_task = None;
+        self.search_sessions.clear();
+        self.search_results_open = false;
+        self.document.cancel_background_index();
+        document.start_background_index();
+        self.overview_estimated_total_lines = estimate_total_lines(document.len(), &window);
+        self.document = document;
+        self.window = window;
+        self.requested_offset = 0;
+        self.visible_row = None;
+        self.editor_scroll_offset = Some(0.0);
+        self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
+        self.editor_horizontal_offset = 0.0;
+        self.index_was_complete = false;
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
+        self.selected_search_hit = None;
+        self.search_select_all = false;
+        self.editing_line = None;
+        self.edit_buffer.clear();
+        self.edits.clear();
+        self.highlights.clear();
+        if is_json {
+            self.json_index_started = false;
+            self.json_outline = None;
+            self.json_index_error = None;
+            self.json_filter_cache_query.clear();
+            self.json_filter_matches.clear();
+            self.selected_json_node = None;
+            self.formatted_json_temp = Some(temporary);
+        } else {
+            self.xml_index_started = false;
+            self.xml_outline = None;
+            self.xml_index_error = None;
+            self.xml_filter_cache_query.clear();
+            self.xml_filter_matches.clear();
+            self.selected_xml_node = None;
+            self.formatted_xml_temp = Some(temporary);
+        }
+        self.refresh_highlights();
+    }
+
+    fn toggle_edit_mode(&mut self) {
+        self.edit_mode = !self.edit_mode;
+        if self.edit_mode {
+            self.status_message = "编辑模式：选择完整文本行后可修改；Ctrl+Shift+S 保存副本".into();
+            if let Some(line) = self.selected_editor_line {
+                self.begin_edit_line(line);
+            }
+        } else {
+            self.editing_line = None;
+            self.edit_buffer.clear();
+            self.status_message = if self.dirty() {
+                format!("已退出编辑模式，仍有 {} 行未保存修改", self.edits.len())
+            } else {
+                "已退出编辑模式".into()
+            };
+        }
+    }
+
+    fn begin_edit_line(&mut self, byte_start: u64) {
+        let Some(line) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start == byte_start)
+        else {
+            self.status_message = "所选行不在当前窗口中".into();
+            return;
+        };
+        if line.prefix_truncated || line.suffix_truncated || line.utf8_lossy {
+            self.status_message = "超长行片段或非 UTF-8 行暂不允许直接编辑".into();
+            return;
+        }
+        self.editing_line = Some(byte_start);
+        self.edit_buffer = self
+            .edits
+            .get(&byte_start)
+            .map_or_else(|| line.text.clone(), |patch| patch.replacement.clone());
+        self.status_message = format!("正在编辑字节 {byte_start} 所在行");
+    }
+
+    fn update_current_edit(&mut self) {
+        let Some(byte_start) = self.editing_line else {
+            return;
+        };
+        let Some(line) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start == byte_start)
+        else {
+            return;
+        };
+        if self.edit_buffer == line.text {
+            self.edits.remove(&byte_start);
+        } else {
+            let line_ending_bytes = match line.line_ending {
+                nkg_text_engine::LineEnding::CrLf => 2,
+                nkg_text_engine::LineEnding::Lf => 1,
+                nkg_text_engine::LineEnding::None => 0,
+            };
+            self.edits.insert(
+                byte_start,
+                LinePatch {
+                    original_end: line.byte_end.saturating_sub(line_ending_bytes),
+                    replacement: self.edit_buffer.clone(),
+                },
+            );
+        }
+        self.status_message = format!("{} 行已修改，尚未保存", self.edits.len());
+    }
+
+    fn revert_current_edit(&mut self) {
+        let Some(byte_start) = self.editing_line else {
+            return;
+        };
+        self.edits.remove(&byte_start);
+        if let Some(line) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start == byte_start)
+        {
+            self.edit_buffer.clone_from(&line.text);
+        }
+        self.status_message = "已撤销当前行修改".into();
+    }
+
+    fn clear_all_edits(&mut self) {
+        self.edits.clear();
+        if let Some(byte_start) = self.editing_line
+            && let Some(line) = self
+                .window
+                .lines
+                .iter()
+                .find(|line| line.byte_start == byte_start)
+        {
+            self.edit_buffer.clone_from(&line.text);
+        }
+        self.status_message = "已撤销全部修改".into();
+    }
+
+    fn start_save_copy(&mut self, destination: PathBuf, context: &egui::Context) {
+        if self.save_task.is_some() {
+            self.status_message = "当前保存任务仍在进行".into();
+            return;
+        }
+        if same_path(&self.path, &destination) {
+            self.status_message = "为保护原文件，请先保存为另一个路径".into();
+            return;
+        }
+
+        let document = Arc::clone(&self.document);
+        let patches = self.edits.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        let worker_destination = destination.clone();
+        let total = document.len();
+
+        std::thread::Builder::new()
+            .name("nkg-save-copy".into())
+            .spawn(move || {
+                let mut next_progress = 0_u64;
+                let result = save_patched_copy(
+                    &document,
+                    &patches,
+                    &worker_destination,
+                    &worker_cancel,
+                    |source_bytes, total_bytes| {
+                        if source_bytes >= next_progress || source_bytes == total_bytes {
+                            let _ = sender.send(SaveEvent::Progress {
+                                source_bytes,
+                                total_bytes,
+                            });
+                            next_progress = source_bytes.saturating_add(64 * 1024 * 1024);
+                            repaint_context.request_repaint();
+                        }
+                    },
+                )
+                .map(|bytes| (worker_destination, bytes));
+                let _ = sender.send(SaveEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn save thread");
+
+        self.save_task = Some(SaveTask { receiver, cancel });
+        self.save_progress = Some((0, total));
+        self.status_message = format!("正在保存副本：{}", destination.display());
+    }
+
+    fn ensure_json_format(&mut self, context: &egui::Context) {
+        if !self.json_format_needed || self.json_format_started {
+            return;
+        }
+        self.json_format_started = true;
+        let document = Arc::clone(&self.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        let total = document.len();
+        std::thread::Builder::new()
+            .name("nkg-json-format".into())
+            .spawn(move || {
+                let result = format_json_to_temp(&document, &worker_cancel, |scanned, total| {
+                    let _ = sender.send(JsonFormatEvent::Progress { scanned, total });
+                    repaint_context.request_repaint();
+                });
+                let _ = sender.send(JsonFormatEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn JSON format thread");
+        self.json_format_task = Some(JsonFormatTask { receiver, cancel });
+        self.json_format_progress = Some((0, total));
+        self.status_message = "正在后台流式格式化单行 JSON…".into();
+    }
+
+    fn ensure_json_index(&mut self, context: &egui::Context) {
+        if !self.is_json
+            || self.json_index_started
+            || (self.json_format_needed && self.formatted_json_temp.is_none())
+            || !self.document.index_status().complete
+        {
+            return;
+        }
+        self.json_index_started = true;
+        let document = Arc::clone(&self.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        let total = document.len();
+        std::thread::Builder::new()
+            .name("nkg-json-index".into())
+            .spawn(move || {
+                let result = scan_json_outline(&document, &worker_cancel, |scanned, total| {
+                    let _ = sender.send(JsonIndexEvent::Progress { scanned, total });
+                    repaint_context.request_repaint();
+                });
+                let _ = sender.send(JsonIndexEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn JSON index thread");
+        self.json_index_task = Some(JsonIndexTask { receiver, cancel });
+        self.json_index_progress = Some((0, total));
+        self.status_message = "正在后台建立 JSON 结构索引…".into();
+    }
+
+    fn ensure_xml_format(&mut self, context: &egui::Context) {
+        if !self.xml_format_needed || self.xml_format_started {
+            return;
+        }
+        self.xml_format_started = true;
+        let document = Arc::clone(&self.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        let total = document.len();
+        std::thread::Builder::new()
+            .name("nkg-xml-format".into())
+            .spawn(move || {
+                let result = format_xml_to_temp(&document, &worker_cancel, |scanned, total| {
+                    let _ = sender.send(XmlFormatEvent::Progress { scanned, total });
+                    repaint_context.request_repaint();
+                });
+                let _ = sender.send(XmlFormatEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn XML format thread");
+        self.xml_format_task = Some(XmlFormatTask { receiver, cancel });
+        self.xml_format_progress = Some((0, total));
+        self.status_message = "正在后台流式格式化单行 XML…".into();
+    }
+
+    fn ensure_xml_index(&mut self, context: &egui::Context) {
+        if !self.is_xml
+            || self.xml_index_started
+            || (self.xml_format_needed && self.formatted_xml_temp.is_none())
+            || !self.document.index_status().complete
+        {
+            return;
+        }
+        if self.document.len() > MAX_XML_OUTLINE_BYTES {
+            self.xml_index_started = true;
+            let message = format!(
+                "XML 大于 {}，为限制单事件内存，结构索引已禁用；可使用全文件搜索",
+                format_bytes(MAX_XML_OUTLINE_BYTES)
+            );
+            self.xml_index_error = Some(message.clone());
+            self.status_message = message;
+            return;
+        }
+        self.xml_index_started = true;
+        let document = Arc::clone(&self.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        let total = document.len();
+        std::thread::Builder::new()
+            .name("nkg-xml-index".into())
+            .spawn(move || {
+                let result = scan_xml_outline(&document, &worker_cancel, |scanned, total| {
+                    let _ = sender.send(XmlIndexEvent::Progress { scanned, total });
+                    repaint_context.request_repaint();
+                });
+                let _ = sender.send(XmlIndexEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn XML index thread");
+        self.xml_index_task = Some(XmlIndexTask { receiver, cancel });
+        self.xml_index_progress = Some((0, total));
+        self.status_message = "正在后台建立 XML 结构索引…".into();
+    }
+
+    fn page_down(&mut self) {
+        let page = self.editor_visible_line_capacity.max(1) as usize;
+        let current = self.visible_row.unwrap_or(0);
+        let target = current.saturating_add(page.saturating_sub(1));
+        if target < self.window.lines.len() {
+            self.editor_scroll_offset = Some(target as f32 * self.editor_row_height);
+            self.requested_offset = self.window.lines[target].byte_start;
+        } else if !self.window.reached_end {
+            let anchor = current.min(self.window.lines.len().saturating_sub(1));
+            self.continue_forward(anchor, self.editor_row_height);
+            let target = self
+                .visible_row
+                .unwrap_or(0)
+                .saturating_add(page.saturating_sub(1))
+                .min(self.window.lines.len().saturating_sub(1));
+            self.editor_scroll_offset = Some(target as f32 * self.editor_row_height);
+        } else {
+            self.editor_stick_to_bottom = true;
+        }
+        self.editing_line = None;
+        self.selected_json_node = None;
+        self.selected_xml_node = None;
+    }
+
+    fn page_up(&mut self) {
+        let page = self.editor_visible_line_capacity.max(1) as usize;
+        let current = self.visible_row.unwrap_or(0);
+        if current >= page {
+            let target = current - page;
+            self.editor_scroll_offset = Some(target as f32 * self.editor_row_height);
+            self.requested_offset = self.window.lines[target].byte_start;
+        } else if self.window.start_offset > 0 {
+            self.continue_backward(self.editor_row_height);
+            let anchor = self
+                .editor_scroll_offset
+                .unwrap_or_default()
+                .div_euclid(self.editor_row_height) as usize;
+            let target = anchor.saturating_sub(page);
+            self.editor_scroll_offset = Some(target as f32 * self.editor_row_height);
+            if let Some(line) = self.window.lines.get(target) {
+                self.requested_offset = line.byte_start;
+            }
+        } else {
+            self.editor_scroll_offset = Some(0.0);
+            self.requested_offset = 0;
+        }
+        self.editing_line = None;
+        self.selected_json_node = None;
+        self.selected_xml_node = None;
+    }
+
     fn load_offset(&mut self, offset: u64) {
         match read_window(&self.document, offset) {
             Ok(window) => {
@@ -324,10 +1064,13 @@ impl DocumentView {
                 self.window = window;
                 self.visible_row = None;
                 self.editor_scroll_offset = Some(0.0);
+                self.editor_center_offset = None;
                 self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
                 self.editor_stick_to_bottom = false;
                 self.editor_horizontal_offset = 0.0;
                 self.editor_horizontal_drag_offset = None;
+                self.selected_json_node = None;
+                self.selected_xml_node = None;
                 self.refresh_highlights();
                 self.status_message = "已跳转".into();
             }
@@ -360,10 +1103,13 @@ impl DocumentView {
                 self.window = window;
                 self.visible_row = None;
                 self.editor_scroll_offset = None;
+                self.editor_center_offset = None;
                 self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
                 self.editor_stick_to_bottom = true;
                 self.editor_horizontal_offset = 0.0;
                 self.editor_horizontal_drag_offset = None;
+                self.selected_json_node = None;
+                self.selected_xml_node = None;
                 self.refresh_highlights();
                 self.status_message = "已到达文件末尾".into();
             }
@@ -372,24 +1118,41 @@ impl DocumentView {
     }
 
     fn continue_forward(&mut self, anchor_row: usize, row_height: f32) {
-        if self.window.reached_end || self.window.lines.len() < 2 {
+        if self.window.reached_end || self.window.lines.is_empty() {
             return;
         }
-        let shift_row = (self.window.lines.len() * 4 / 5)
-            .max(1)
-            .min(self.window.lines.len() - 1);
         let anchor_byte = self.window.lines[anchor_row.min(self.window.lines.len() - 1)].byte_start;
-        let next_start = self.window.lines[shift_row].byte_start;
-        if let Ok(window) = read_window(&self.document, next_start) {
-            let anchor_in_new = window
-                .lines
-                .partition_point(|line| line.byte_start < anchor_byte)
-                .min(window.lines.len().saturating_sub(1));
-            self.requested_offset = window.start_offset;
-            self.window = window;
-            self.editor_scroll_offset = Some(anchor_in_new as f32 * row_height);
-            self.editor_stick_to_bottom = false;
-            self.refresh_highlights();
+        let (next_start, continues_truncated_line) = if self.window.lines.len() == 1 {
+            (self.window.next_offset, true)
+        } else {
+            let shift_row = (self.window.lines.len() * 4 / 5)
+                .max(1)
+                .min(self.window.lines.len() - 1);
+            (self.window.lines[shift_row].byte_start, false)
+        };
+        if next_start <= self.window.start_offset {
+            return;
+        }
+
+        let result = if continues_truncated_line {
+            read_exact_window(&self.document, next_start)
+        } else {
+            read_window(&self.document, next_start)
+        };
+        match result {
+            Ok(window) => {
+                let anchor_in_new = window
+                    .lines
+                    .partition_point(|line| line.byte_start < anchor_byte)
+                    .min(window.lines.len().saturating_sub(1));
+                self.requested_offset = window.start_offset;
+                self.window = window;
+                self.editor_scroll_offset = Some(anchor_in_new as f32 * row_height);
+                self.editor_center_offset = None;
+                self.editor_stick_to_bottom = false;
+                self.refresh_highlights();
+            }
+            Err(error) => self.status_message = error,
         }
     }
 
@@ -418,8 +1181,29 @@ impl DocumentView {
             self.requested_offset = window.start_offset;
             self.window = window;
             self.editor_scroll_offset = Some(anchor_in_new as f32 * row_height);
+            self.editor_center_offset = None;
             self.editor_stick_to_bottom = false;
             self.refresh_highlights();
+        }
+    }
+
+    fn load_centered_offset(&mut self, offset: u64) {
+        match read_centered_window(&self.document, offset) {
+            Ok(window) => {
+                let offset = offset.min(self.document.len());
+                self.requested_offset = offset;
+                self.window = window;
+                self.visible_row = None;
+                self.editor_scroll_offset = None;
+                self.editor_center_offset = Some(offset);
+                self.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
+                self.editor_stick_to_bottom = false;
+                self.editor_horizontal_offset = 0.0;
+                self.editor_horizontal_drag_offset = None;
+                self.refresh_highlights();
+                self.status_message = "已跳转".into();
+            }
+            Err(error) => self.status_message = error,
         }
     }
 
@@ -457,12 +1241,19 @@ impl DocumentView {
         self.selection_surface = SelectionSurface::Editor;
         self.selected_editor_line = Some(byte_start);
         self.editor_select_all = false;
+        self.selected_json_node = None;
+        self.selected_xml_node = None;
+        if self.edit_mode {
+            self.begin_edit_line(byte_start);
+        }
     }
 
     fn begin_editor_text_selection(&mut self) {
         self.selection_surface = SelectionSurface::Editor;
         self.selected_editor_line = None;
         self.editor_select_all = false;
+        self.selected_json_node = None;
+        self.selected_xml_node = None;
     }
 
     fn select_search_hit(&mut self, session_id: u64, hit_index: u64) {
@@ -497,6 +1288,8 @@ impl DocumentView {
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let quota_reached = Arc::new(AtomicBool::new(false));
+        let worker_quota_reached = Arc::clone(&quota_reached);
         let document = Arc::clone(&self.document);
         let result_store = Arc::clone(&store);
         let result_query = self.query.clone();
@@ -524,6 +1317,10 @@ impl DocumentView {
                         &result_store,
                         &worker_cancel,
                         |progress| {
+                            if result_store.disk_bytes() >= MAX_SEARCH_RESULT_DISK_BYTES {
+                                worker_quota_reached.store(true, Ordering::Release);
+                                worker_cancel.store(true, Ordering::Release);
+                            }
                             if progress.scanned_bytes >= next_progress_report
                                 || progress.scanned_bytes == progress.total_bytes
                             {
@@ -544,7 +1341,11 @@ impl DocumentView {
             session_id,
             receiver,
             cancel,
+            quota_reached,
         });
+        if self.search_sessions.len() >= MAX_SEARCH_SESSIONS {
+            self.search_sessions.remove(0);
+        }
         self.search_sessions.push(SearchSession {
             id: session_id,
             query: result_query,
@@ -557,7 +1358,7 @@ impl DocumentView {
             result: None,
             error: None,
             expanded: true,
-            preview_cache: HashMap::new(),
+            preview_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         self.search_results_open = true;
         self.search_scroll_offset = search_session_rows(&self.search_sessions)
@@ -577,6 +1378,7 @@ impl DocumentView {
         let mut finished = false;
         if let Some(task) = &self.search_task {
             let session_id = task.session_id;
+            let quota_reached = task.quota_reached.load(Ordering::Acquire);
             let events = task.receiver.try_iter().collect::<Vec<_>>();
             for event in events {
                 if let Some(session) = self
@@ -595,7 +1397,13 @@ impl DocumentView {
                                         total_bytes: result.search_bytes,
                                         hit_count: result.hit_count,
                                     };
-                                    self.status_message = if result.cancelled {
+                                    self.status_message = if quota_reached {
+                                        format!(
+                                            "搜索结果达到 {} 临时盘上限：已保留 {} 个结果",
+                                            format_bytes(MAX_SEARCH_RESULT_DISK_BYTES),
+                                            result.hit_count
+                                        )
+                                    } else if result.cancelled {
                                         format!("搜索已取消：已收集 {} 个结果", result.hit_count)
                                     } else {
                                         format!("搜索完成：{} 个结果", result.hit_count)
@@ -616,6 +1424,232 @@ impl DocumentView {
             self.search_task = None;
         }
 
+        let save_events = self
+            .save_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut save_finished = false;
+        for event in save_events {
+            match event {
+                SaveEvent::Progress {
+                    source_bytes,
+                    total_bytes,
+                } => self.save_progress = Some((source_bytes, total_bytes)),
+                SaveEvent::Finished(result) => {
+                    save_finished = true;
+                    self.save_progress = None;
+                    self.status_message = match result {
+                        Ok((path, bytes)) => {
+                            format!("已保存副本：{}（{}）", path.display(), format_bytes(bytes))
+                        }
+                        Err(error) => format!("保存失败：{error}"),
+                    };
+                }
+            }
+        }
+        if save_finished {
+            self.save_task = None;
+        }
+
+        let format_events = self
+            .json_format_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut format_finished = false;
+        for event in format_events {
+            match event {
+                JsonFormatEvent::Progress { scanned, total } => {
+                    self.json_format_progress = Some((scanned, total));
+                }
+                JsonFormatEvent::Finished(result) => {
+                    format_finished = true;
+                    self.json_format_progress = None;
+                    self.json_format_needed = false;
+                    match result {
+                        Ok((temporary, formatted_bytes)) => {
+                            if !self.can_switch_to_formatted_view() {
+                                self.document.start_background_index();
+                                self.status_message =
+                                    "检测到编辑、保存或搜索状态，已保留原始 JSON 视图".into();
+                                continue;
+                            }
+                            let switched = (|| {
+                                let document = TextDocument::open(temporary.path())
+                                    .map_err(|error| error.to_string())?;
+                                let window = read_window(&document, 0)?;
+                                Ok::<_, String>((document, window))
+                            })();
+                            match switched {
+                                Ok((document, window)) => {
+                                    self.install_formatted_document(
+                                        document, window, temporary, true,
+                                    );
+                                    self.status_message = format!(
+                                        "单行 JSON 已格式化为临时视图：{} → {}",
+                                        format_bytes(self.original_file_len),
+                                        format_bytes(formatted_bytes)
+                                    );
+                                }
+                                Err(error) => {
+                                    self.document.start_background_index();
+                                    self.json_format_error = Some(error.clone());
+                                    self.status_message =
+                                        format!("无法打开 JSON 格式化视图：{error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.document.start_background_index();
+                            self.json_format_error = Some(error.clone());
+                            self.status_message = format!("JSON 自动格式化失败：{error}");
+                        }
+                    }
+                }
+            }
+        }
+        if format_finished {
+            self.json_format_task = None;
+        }
+
+        let json_events = self
+            .json_index_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut json_finished = false;
+        for event in json_events {
+            match event {
+                JsonIndexEvent::Progress { scanned, total } => {
+                    self.json_index_progress = Some((scanned, total));
+                }
+                JsonIndexEvent::Finished(result) => {
+                    json_finished = true;
+                    self.json_index_progress = None;
+                    match result {
+                        Ok(outline) => {
+                            self.status_message = format!(
+                                "JSON 结构索引完成：{} 个节点，已扫描 {}",
+                                outline.nodes.len(),
+                                format_bytes(outline.scanned_bytes)
+                            );
+                            self.json_filter_cache_query.clear();
+                            self.json_filter_matches.clear();
+                            self.json_outline = Some(outline);
+                            self.json_index_error = None;
+                        }
+                        Err(error) => {
+                            self.status_message = format!("JSON 结构索引失败：{error}");
+                            self.json_index_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        if json_finished {
+            self.json_index_task = None;
+        }
+
+        let xml_format_events = self
+            .xml_format_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut xml_format_finished = false;
+        for event in xml_format_events {
+            match event {
+                XmlFormatEvent::Progress { scanned, total } => {
+                    self.xml_format_progress = Some((scanned, total));
+                }
+                XmlFormatEvent::Finished(result) => {
+                    xml_format_finished = true;
+                    self.xml_format_progress = None;
+                    self.xml_format_needed = false;
+                    match result {
+                        Ok((temporary, formatted_bytes)) => {
+                            if !self.can_switch_to_formatted_view() {
+                                self.document.start_background_index();
+                                self.status_message =
+                                    "检测到编辑、保存或搜索状态，已保留原始 XML 视图".into();
+                                continue;
+                            }
+                            let switched = (|| {
+                                let document = TextDocument::open(temporary.path())
+                                    .map_err(|error| error.to_string())?;
+                                let window = read_window(&document, 0)?;
+                                Ok::<_, String>((document, window))
+                            })();
+                            match switched {
+                                Ok((document, window)) => {
+                                    self.install_formatted_document(
+                                        document, window, temporary, false,
+                                    );
+                                    self.status_message = format!(
+                                        "单行 XML 已格式化为临时视图：{} → {}",
+                                        format_bytes(self.original_file_len),
+                                        format_bytes(formatted_bytes)
+                                    );
+                                }
+                                Err(error) => {
+                                    self.document.start_background_index();
+                                    self.xml_format_error = Some(error.clone());
+                                    self.status_message =
+                                        format!("无法打开 XML 格式化视图：{error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.document.start_background_index();
+                            self.xml_format_error = Some(error.clone());
+                            self.status_message = format!("XML 自动格式化失败：{error}");
+                        }
+                    }
+                }
+            }
+        }
+        if xml_format_finished {
+            self.xml_format_task = None;
+        }
+
+        let xml_events = self
+            .xml_index_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut xml_finished = false;
+        for event in xml_events {
+            match event {
+                XmlIndexEvent::Progress { scanned, total } => {
+                    self.xml_index_progress = Some((scanned, total));
+                }
+                XmlIndexEvent::Finished(result) => {
+                    xml_finished = true;
+                    self.xml_index_progress = None;
+                    match result {
+                        Ok(outline) => {
+                            self.status_message = format!(
+                                "XML 结构索引完成：{} 个节点，已扫描 {}",
+                                outline.nodes.len(),
+                                format_bytes(outline.scanned_bytes)
+                            );
+                            self.xml_filter_cache_query.clear();
+                            self.xml_filter_matches.clear();
+                            self.xml_outline = Some(outline);
+                            self.xml_index_error = None;
+                        }
+                        Err(error) => {
+                            self.status_message = format!("XML 结构索引失败：{error}");
+                            self.xml_index_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        if xml_finished {
+            self.xml_index_task = None;
+        }
+
         let index_status = self.document.index_status();
         if index_status.complete && !self.index_was_complete {
             self.index_was_complete = true;
@@ -628,7 +1662,7 @@ impl DocumentView {
     fn jump_to_hit(&mut self, hit: SearchHit) {
         self.selected_editor_line = None;
         self.editor_select_all = false;
-        self.load_offset(hit.byte_start);
+        self.load_centered_offset(hit.byte_start);
         if let Some(line_start) = self
             .window
             .lines
@@ -639,6 +1673,40 @@ impl DocumentView {
             self.select_editor_line(line_start);
         }
         self.status_message = format!("搜索命中：{}..{}", hit.byte_start, hit.byte_end);
+    }
+
+    fn jump_to_json_node(&mut self, node_id: usize, offset: u64, label: &str) {
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
+        self.load_centered_offset(offset);
+        if let Some(line_start) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start <= offset && offset < line.byte_end)
+            .map(|line| line.byte_start)
+        {
+            self.select_editor_line(line_start);
+        }
+        self.selected_json_node = Some(node_id);
+        self.status_message = format!("已跳转 JSON 节点：{label}");
+    }
+
+    fn jump_to_xml_node(&mut self, node_id: usize, offset: u64, label: &str) {
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
+        self.load_centered_offset(offset);
+        if let Some(line_start) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start <= offset && offset < line.byte_end)
+            .map(|line| line.byte_start)
+        {
+            self.select_editor_line(line_start);
+        }
+        self.selected_xml_node = Some(node_id);
+        self.status_message = format!("已跳转 XML 节点：<{label}>");
     }
 
     fn remove_search_session(&mut self, session_id: u64) {
@@ -668,7 +1736,24 @@ impl DocumentView {
 impl Drop for DocumentView {
     fn drop(&mut self) {
         self.cancel_search();
-        self.document.cancel_background_index();
+        if let Some(task) = &self.save_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if let Some(task) = &self.json_index_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if let Some(task) = &self.json_format_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if let Some(task) = &self.xml_index_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if let Some(task) = &self.xml_format_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if Arc::strong_count(&self.document) == 1 {
+            self.document.cancel_background_index();
+        }
     }
 }
 
@@ -680,6 +1765,11 @@ struct DiffView {
     left_window: TextWindow,
     right_window: TextWindow,
     exact_summary: WindowDiffSummary,
+    structured_kind: Option<StructuredDiffKind>,
+    structured_prepare_task: Option<StructuredPrepareTask>,
+    structured_progress: Option<(u64, u64)>,
+    structured_left_temp: Option<tempfile::NamedTempFile>,
+    structured_right_temp: Option<tempfile::NamedTempFile>,
     block_task: Option<BlockDiffTask>,
     block_progress: Option<(u64, u64)>,
     block_summary: Option<BlockDiffSummary>,
@@ -697,7 +1787,13 @@ impl DiffView {
         context: &egui::Context,
     ) -> Result<Self, String> {
         let right_document = TextDocument::open(&right_path).map_err(|error| error.to_string())?;
-        right_document.start_background_index();
+        let structured_kind = structured_diff_kind(&left_path, &right_path).filter(|_| {
+            left_document.len() <= MAX_STRUCTURED_DIFF_BYTES
+                && right_document.len() <= MAX_STRUCTURED_DIFF_BYTES
+        });
+        if structured_kind.is_none() {
+            right_document.start_background_index();
+        }
         let left_window = read_diff_window(&left_document, 0)?;
         let right_window = read_diff_window(&right_document, 0)?;
         let exact_summary =
@@ -712,16 +1808,98 @@ impl DiffView {
             left_window,
             right_window,
             exact_summary,
+            structured_kind,
+            structured_prepare_task: None,
+            structured_progress: None,
+            structured_left_temp: None,
+            structured_right_temp: None,
             block_task: None,
             block_progress: None,
             block_summary: None,
-            status_message: "正在生成全文件差异概览…".into(),
+            status_message: structured_kind.map_or_else(
+                || "正在生成全文件差异概览…".into(),
+                |kind| format!("正在准备{}…", kind.label()),
+            ),
             ratio: 0.0,
             reset_scroll: true,
             indexes_refreshed: false,
         };
-        view.start_block_diff(context);
+        if let Some(kind) = structured_kind {
+            view.start_structured_prepare(kind, context);
+        } else {
+            view.start_block_diff(context);
+        }
         Ok(view)
+    }
+
+    fn background_active(&self) -> bool {
+        self.structured_prepare_task.is_some()
+            || self.block_task.is_some()
+            || self.left_document.index_status().running
+            || self.right_document.index_status().running
+    }
+
+    fn start_structured_prepare(&mut self, kind: StructuredDiffKind, context: &egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let left = Arc::clone(&self.left_document);
+        let right = Arc::clone(&self.right_document);
+        let left_total = left.len();
+        let right_total = right.len();
+        let total = left_total.saturating_add(right_total);
+        let repaint_context = context.clone();
+
+        std::thread::Builder::new()
+            .name("nkg-structured-diff-prepare".into())
+            .spawn(move || {
+                let result = (|| {
+                    let (left_temp, _) = match kind {
+                        StructuredDiffKind::Json => {
+                            format_json_to_temp(&left, &worker_cancel, |processed, _| {
+                                let _ = sender
+                                    .send(StructuredPrepareEvent::Progress { processed, total });
+                                repaint_context.request_repaint();
+                            })
+                        }
+                        StructuredDiffKind::Xml => {
+                            canonicalize_xml_to_temp(&left, &worker_cancel, |processed, _| {
+                                let _ = sender
+                                    .send(StructuredPrepareEvent::Progress { processed, total });
+                                repaint_context.request_repaint();
+                            })
+                        }
+                    }?;
+                    let (right_temp, _) = match kind {
+                        StructuredDiffKind::Json => {
+                            format_json_to_temp(&right, &worker_cancel, |processed, _| {
+                                let _ = sender.send(StructuredPrepareEvent::Progress {
+                                    processed: left_total.saturating_add(processed),
+                                    total,
+                                });
+                                repaint_context.request_repaint();
+                            })
+                        }
+                        StructuredDiffKind::Xml => {
+                            canonicalize_xml_to_temp(&right, &worker_cancel, |processed, _| {
+                                let _ = sender.send(StructuredPrepareEvent::Progress {
+                                    processed: left_total.saturating_add(processed),
+                                    total,
+                                });
+                                repaint_context.request_repaint();
+                            })
+                        }
+                    }?;
+                    Ok::<_, String>((left_temp, right_temp))
+                })();
+                let _ = sender.send(StructuredPrepareEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn structured diff preparation thread");
+
+        self.structured_prepare_task = Some(StructuredPrepareTask { receiver, cancel });
+        self.structured_progress = Some((0, total));
+        self.status_message = format!("正在准备{}…", kind.label());
     }
 
     fn start_block_diff(&mut self, context: &egui::Context) {
@@ -768,7 +1946,73 @@ impl DiffView {
         }
     }
 
-    fn poll_background(&mut self) {
+    fn poll_background(&mut self, context: &egui::Context) {
+        let structured_events = self
+            .structured_prepare_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut structured_finished = false;
+        for event in structured_events {
+            match event {
+                StructuredPrepareEvent::Progress { processed, total } => {
+                    self.structured_progress = Some((processed, total));
+                }
+                StructuredPrepareEvent::Finished(result) => {
+                    structured_finished = true;
+                    self.structured_progress = None;
+                    match result {
+                        Ok((left_temp, right_temp)) => {
+                            let switched = (|| {
+                                let left = TextDocument::open(left_temp.path())
+                                    .map_err(|error| error.to_string())?;
+                                let right = TextDocument::open(right_temp.path())
+                                    .map_err(|error| error.to_string())?;
+                                left.start_background_index();
+                                right.start_background_index();
+                                Ok::<_, String>((left, right))
+                            })();
+                            match switched {
+                                Ok((left, right)) => {
+                                    self.right_document.cancel_background_index();
+                                    self.left_document = left;
+                                    self.right_document = right;
+                                    self.structured_left_temp = Some(left_temp);
+                                    self.structured_right_temp = Some(right_temp);
+                                    self.indexes_refreshed = false;
+                                    self.load_offsets(0, 0);
+                                    self.block_summary = None;
+                                    self.start_block_diff(context);
+                                    if let Some(kind) = self.structured_kind {
+                                        self.status_message =
+                                            format!("{}已规范化，正在分析差异…", kind.label());
+                                    }
+                                }
+                                Err(error) => {
+                                    self.status_message = format!(
+                                        "无法打开结构对比临时视图，已回退文本对比：{error}"
+                                    );
+                                    self.structured_kind = None;
+                                    self.right_document.start_background_index();
+                                    self.start_block_diff(context);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.status_message =
+                                format!("结构对比准备失败，已回退文本对比：{error}");
+                            self.structured_kind = None;
+                            self.right_document.start_background_index();
+                            self.start_block_diff(context);
+                        }
+                    }
+                }
+            }
+        }
+        if structured_finished {
+            self.structured_prepare_task = None;
+        }
+
         let mut finished = None;
         if let Some(task) = &self.block_task {
             while let Ok(event) = task.receiver.try_recv() {
@@ -782,12 +2026,16 @@ impl DiffView {
         }
         if let Some(result) = finished {
             self.block_task = None;
+            self.block_progress = None;
             match result {
                 Ok(summary) => {
+                    let difference_count = block_difference_count(&summary);
                     self.status_message = if summary.cancelled {
                         "差异分析已取消".into()
+                    } else if let Some(kind) = self.structured_kind {
+                        format!("{}完成：发现 {difference_count} 处差异", kind.label())
                     } else {
-                        format!("差异分析完成：发现 {} 处差异", summary.runs.len())
+                        format!("差异分析完成：发现 {difference_count} 处差异")
                     };
                     self.block_summary = Some(summary);
                 }
@@ -871,6 +2119,12 @@ impl DiffView {
 impl Drop for DiffView {
     fn drop(&mut self) {
         self.cancel_block_diff();
+        if let Some(task) = &self.structured_prepare_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if self.structured_left_temp.is_some() {
+            self.left_document.cancel_background_index();
+        }
         self.right_document.cancel_background_index();
     }
 }
@@ -1007,8 +2261,56 @@ impl NkgApp {
         if index >= self.tabs.len() {
             return;
         }
+        if self.tabs[index].dirty() {
+            self.global_message =
+                "该标签仍有未保存修改；请先保存副本或在编辑栏中撤销全部修改".into();
+            return;
+        }
+        let closing_path = self.tabs[index].path.clone();
         self.tabs.remove(index);
-        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        } else if index == self.active_tab {
+            self.active_tab = index.min(self.tabs.len().saturating_sub(1));
+        }
+        if self.search_comparison.as_ref().is_some_and(|comparison| {
+            comparison.left.key.path == closing_path || comparison.right.key.path == closing_path
+        }) {
+            self.search_comparison = None;
+        }
+        if self
+            .search_comparison_left
+            .as_ref()
+            .is_some_and(|source| source.key.path == closing_path)
+        {
+            self.search_comparison_left = None;
+        }
+    }
+
+    fn save_copy_dialog(&mut self, context: &egui::Context) {
+        let Some(tab) = self.active() else {
+            self.global_message = "请先打开文件".into();
+            return;
+        };
+        let suggested_name = tab.path.file_stem().map_or_else(
+            || "edited.txt".into(),
+            |stem| {
+                let extension = tab
+                    .path
+                    .extension()
+                    .map(|extension| format!(".{}", extension.to_string_lossy()))
+                    .unwrap_or_default();
+                format!("{}-edited{extension}", stem.to_string_lossy())
+            },
+        );
+        if let Some(destination) = rfd::FileDialog::new()
+            .set_title("保存编辑后的副本")
+            .set_file_name(suggested_name)
+            .save_file()
+            && let Some(tab) = self.active_mut()
+        {
+            tab.start_save_copy(destination, context);
+        }
     }
 
     fn choose_search_comparison_source(&mut self, source: SearchComparisonSource) {
@@ -1052,6 +2354,28 @@ impl NkgApp {
             self.sidebar_mode = SidebarMode::Search;
             self.sidebar_visible = true;
             self.search_focus_requested = true;
+        }
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::E))
+            && let Some(tab) = self.active_mut()
+        {
+            tab.toggle_edit_mode();
+        }
+        let mut save_modifiers = egui::Modifiers::CTRL;
+        save_modifiers.shift = true;
+        if context.input_mut(|input| input.consume_key(save_modifiers, Key::S)) {
+            self.save_copy_dialog(context);
+        }
+        if !context.egui_wants_keyboard_input() && self.sidebar_mode != SidebarMode::Compare {
+            if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::PageDown))
+                && let Some(tab) = self.active_mut()
+            {
+                tab.page_down();
+            }
+            if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::PageUp))
+                && let Some(tab) = self.active_mut()
+            {
+                tab.page_up();
+            }
         }
         let select_all = !context.egui_wants_keyboard_input()
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::A));
@@ -1131,7 +2455,7 @@ impl NkgApp {
                 {
                     self.open_dialog();
                 }
-                let path_width = (content_rect.width() - 355.0).max(180.0);
+                let path_width = (content_rect.width() - 520.0).max(180.0);
                 let response = content_ui.add_sized(
                     [path_width, TITLE_BAR_CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.path_input)
@@ -1151,7 +2475,31 @@ impl NkgApp {
                 {
                     self.open_path(PathBuf::from(self.path_input.trim()));
                 }
-                content_ui.label(RichText::new("只读").color(theme::MUTED));
+                let edit_mode = self.active().is_some_and(|tab| tab.edit_mode);
+                if content_ui
+                    .add(
+                        egui::Button::new(if edit_mode {
+                            "退出编辑  Ctrl+E"
+                        } else {
+                            "编辑  Ctrl+E"
+                        })
+                        .min_size(egui::vec2(0.0, TITLE_BAR_CONTROL_HEIGHT)),
+                    )
+                    .clicked()
+                    && let Some(tab) = self.active_mut()
+                {
+                    tab.toggle_edit_mode();
+                }
+                if self.active().is_some_and(DocumentView::dirty)
+                    && content_ui
+                        .add(
+                            egui::Button::new("保存副本  Ctrl+Shift+S")
+                                .min_size(egui::vec2(0.0, TITLE_BAR_CONTROL_HEIGHT)),
+                        )
+                        .clicked()
+                {
+                    self.save_copy_dialog(content_ui.ctx());
+                }
 
                 let mut controls_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -1175,9 +2523,18 @@ impl NkgApp {
                         .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
                 if window_control_button(&mut controls_ui, WindowControl::Close).clicked() {
-                    controls_ui
-                        .ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Close);
+                    if self.tabs.iter().any(DocumentView::dirty) {
+                        self.global_message =
+                            "仍有未保存修改；请先保存副本或撤销修改后再关闭".into();
+                        let message = self.global_message.clone();
+                        if let Some(tab) = self.active_mut() {
+                            tab.status_message = message;
+                        }
+                    } else {
+                        controls_ui
+                            .ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             });
     }
@@ -1200,6 +2557,18 @@ impl NkgApp {
                             &mut self.sidebar_visible,
                             &mut self.sidebar_mode,
                             SidebarMode::Explorer,
+                        );
+                    }
+                    if activity_button(
+                        ui,
+                        "{}",
+                        "JSON/XML 结构",
+                        self.sidebar_visible && self.sidebar_mode == SidebarMode::Json,
+                    ) {
+                        toggle_sidebar_mode(
+                            &mut self.sidebar_visible,
+                            &mut self.sidebar_mode,
+                            SidebarMode::Json,
                         );
                     }
                     if activity_button(
@@ -1248,6 +2617,13 @@ impl NkgApp {
                     let context = ui.ctx().clone();
                     self.show_search(ui, &context);
                 }
+                SidebarMode::Json => {
+                    if self.active().is_some_and(|tab| tab.is_xml) {
+                        self.show_xml_outline(ui);
+                    } else {
+                        self.show_json_outline(ui);
+                    }
+                }
                 SidebarMode::Compare => {
                     let context = ui.ctx().clone();
                     self.show_compare(ui, &context);
@@ -1283,7 +2659,15 @@ impl NkgApp {
         ui.add_space(12.0);
         if let Some(tab) = self.active() {
             ui.label(RichText::new("文件信息").strong());
-            ui.label(format_bytes(tab.document.len()));
+            if tab.formatted_json_temp.is_some() || tab.formatted_xml_temp.is_some() {
+                ui.label(format!(
+                    "原始 {} · 格式化视图 {}",
+                    format_bytes(tab.original_file_len),
+                    format_bytes(tab.document.len())
+                ));
+            } else {
+                ui.label(format_bytes(tab.document.len()));
+            }
             let status = tab.document.index_status();
             if status.complete {
                 ui.label(format!("{} 行", status.total_lines.unwrap_or_default()));
@@ -1388,6 +2772,353 @@ impl NkgApp {
         }
     }
 
+    fn show_json_outline(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "JSON 结构");
+        let Some(tab) = self.active_mut() else {
+            ui.label("请先打开 JSON 文件");
+            return;
+        };
+        if !tab.is_json {
+            ui.label("当前文件扩展名不是 .json");
+            ui.label(
+                RichText::new("JSON 结构索引只对 JSON 文件启用")
+                    .small()
+                    .color(theme::MUTED),
+            );
+            return;
+        }
+
+        if let Some((scanned, total)) = tab.json_index_progress {
+            ui.label(format!("正在建立结构索引：{:.1}%", percent(scanned, total)));
+            ui.add(
+                egui::ProgressBar::new(if total == 0 {
+                    1.0
+                } else {
+                    (scanned as f32 / total as f32).clamp(0.0, 1.0)
+                })
+                .show_percentage(),
+            );
+        }
+        if let Some((scanned, total)) = tab.json_format_progress {
+            ui.label(format!(
+                "正在格式化单行 JSON：{:.1}%",
+                percent(scanned, total)
+            ));
+            ui.add(
+                egui::ProgressBar::new(if total == 0 {
+                    1.0
+                } else {
+                    (scanned as f32 / total as f32).clamp(0.0, 1.0)
+                })
+                .show_percentage(),
+            );
+        }
+        if let Some(error) = &tab.json_format_error {
+            ui.colored_label(theme::ERROR, error);
+        }
+        if let Some(error) = &tab.json_index_error {
+            ui.colored_label(theme::ERROR, error);
+        }
+        if tab.dirty() {
+            ui.label(
+                RichText::new("结构索引对应原文件；保存副本后重新打开可刷新结构")
+                    .small()
+                    .color(theme::WARNING),
+            );
+        }
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut tab.json_filter)
+                .hint_text("筛选或跳转 Key")
+                .desired_width(f32::INFINITY),
+        );
+        let jump_requested =
+            response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+        let jump_clicked = ui.button("跳转 Key").clicked();
+        ui.add_space(4.0);
+
+        let mut selected = None;
+        if let Some(outline) = &tab.json_outline {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} 个节点", outline.nodes.len()));
+            });
+            let filter = tab.json_filter.trim();
+            if !filter.is_empty() && tab.json_filter_cache_query != filter {
+                tab.json_filter_cache_query.clear();
+                tab.json_filter_cache_query.push_str(filter);
+                tab.json_filter_matches.clear();
+                tab.json_filter_matches.extend(
+                    outline
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(node_id, _)| {
+                            contains_ascii_case_insensitive(outline.label(node_id), filter)
+                                .then_some(node_id)
+                        })
+                        .take(JSON_FILTER_MAX_RESULTS),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt(("json_outline", &tab.path))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if filter.is_empty() {
+                        if !outline.nodes.is_empty() {
+                            show_json_tree_node(
+                                ui,
+                                outline,
+                                0,
+                                0,
+                                tab.selected_json_node,
+                                &mut selected,
+                            );
+                        }
+                    } else {
+                        for &node_id in &tab.json_filter_matches {
+                            let node = &outline.nodes[node_id];
+                            let path = outline
+                                .path(node_id)
+                                .into_iter()
+                                .map(|id| outline.label(id))
+                                .collect::<Vec<_>>()
+                                .join(" › ");
+                            if ui
+                                .selectable_label(
+                                    tab.selected_json_node == Some(node_id),
+                                    format!("{}  {path}", node.kind.icon()),
+                                )
+                                .clicked()
+                            {
+                                selected = Some(node_id);
+                            }
+                        }
+                        if tab.json_filter_matches.len() >= JSON_FILTER_MAX_RESULTS {
+                            ui.label(
+                                RichText::new(format!("仅显示前 {JSON_FILTER_MAX_RESULTS} 个匹配"))
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        } else if tab.json_filter_matches.is_empty() {
+                            ui.label("结构索引中没有匹配；按 Enter 可启动全文件 Key 搜索");
+                        }
+                    }
+                });
+
+            if (jump_requested || jump_clicked) && !tab.json_filter.trim().is_empty() {
+                let query = tab.json_filter.trim();
+                selected = outline
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .position(|(id, _)| outline.label(id) == query)
+                    .or_else(|| {
+                        outline.nodes.iter().enumerate().position(|(id, _)| {
+                            contains_ascii_case_insensitive(outline.label(id), query)
+                        })
+                    });
+                if selected.is_none() {
+                    tab.query = format!("\"{}\"", tab.json_filter.trim());
+                    tab.refresh_highlights();
+                    tab.start_search(ui.ctx());
+                    tab.status_message = "结构索引中未找到，已启动全文件 JSON Key 搜索".into();
+                }
+            }
+        } else if tab.json_index_task.is_none() && tab.json_index_error.is_none() {
+            ui.label("等待 JSON 结构索引启动…");
+        }
+        if (jump_requested || jump_clicked)
+            && tab.json_outline.is_none()
+            && !tab.json_filter.trim().is_empty()
+        {
+            tab.query = format!("\"{}\"", tab.json_filter.trim());
+            tab.refresh_highlights();
+            tab.start_search(ui.ctx());
+            tab.status_message = "JSON 结构尚不可用，已启动全文件 Key 搜索".into();
+        }
+
+        if let Some(node_id) = selected
+            && let Some(outline) = &tab.json_outline
+            && let Some(node) = outline.nodes.get(node_id)
+        {
+            let offset = node.byte_start;
+            let label = outline.label(node_id).to_owned();
+            tab.jump_to_json_node(node_id, offset, &label);
+        }
+    }
+
+    fn show_xml_outline(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "XML 结构");
+        let Some(tab) = self.active_mut() else {
+            ui.label("请先打开 XML 文件");
+            return;
+        };
+        if !tab.is_xml {
+            ui.label("当前文件扩展名不是 .xml");
+            ui.label(
+                RichText::new("结构索引只对 JSON/XML 文件启用")
+                    .small()
+                    .color(theme::MUTED),
+            );
+            return;
+        }
+
+        if let Some((scanned, total)) = tab.xml_index_progress {
+            ui.label(format!("正在建立结构索引：{:.1}%", percent(scanned, total)));
+            ui.add(
+                egui::ProgressBar::new(if total == 0 {
+                    1.0
+                } else {
+                    (scanned as f32 / total as f32).clamp(0.0, 1.0)
+                })
+                .show_percentage(),
+            );
+        }
+        if let Some((scanned, total)) = tab.xml_format_progress {
+            ui.label(format!(
+                "正在格式化单行 XML：{:.1}%",
+                percent(scanned, total)
+            ));
+            ui.add(
+                egui::ProgressBar::new(if total == 0 {
+                    1.0
+                } else {
+                    (scanned as f32 / total as f32).clamp(0.0, 1.0)
+                })
+                .show_percentage(),
+            );
+        }
+        if let Some(error) = &tab.xml_format_error {
+            ui.colored_label(theme::ERROR, error);
+        }
+        if let Some(error) = &tab.xml_index_error {
+            ui.colored_label(theme::ERROR, error);
+        }
+        if tab.dirty() {
+            ui.label(
+                RichText::new("结构索引对应原文件；保存副本后重新打开可刷新结构")
+                    .small()
+                    .color(theme::WARNING),
+            );
+        }
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut tab.xml_filter)
+                .hint_text("筛选或跳转节点名")
+                .desired_width(f32::INFINITY),
+        );
+        let jump_requested =
+            response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+        let jump_clicked = ui.button("跳转节点").clicked();
+        ui.add_space(4.0);
+
+        let mut selected = None;
+        if let Some(outline) = &tab.xml_outline {
+            ui.label(format!("{} 个元素节点", outline.nodes.len()));
+            let filter = tab.xml_filter.trim();
+            if !filter.is_empty() && tab.xml_filter_cache_query != filter {
+                tab.xml_filter_cache_query.clear();
+                tab.xml_filter_cache_query.push_str(filter);
+                tab.xml_filter_matches.clear();
+                tab.xml_filter_matches.extend(
+                    outline
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(node_id, _)| {
+                            contains_ascii_case_insensitive(outline.label(node_id), filter)
+                                .then_some(node_id)
+                        })
+                        .take(JSON_FILTER_MAX_RESULTS),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt(("xml_outline", &tab.path))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if filter.is_empty() {
+                        if !outline.nodes.is_empty() {
+                            show_xml_tree_node(
+                                ui,
+                                outline,
+                                0,
+                                0,
+                                tab.selected_xml_node,
+                                &mut selected,
+                            );
+                        }
+                    } else {
+                        for &node_id in &tab.xml_filter_matches {
+                            let path = outline
+                                .path(node_id)
+                                .into_iter()
+                                .map(|id| outline.label(id))
+                                .collect::<Vec<_>>()
+                                .join(" › ");
+                            if ui
+                                .selectable_label(
+                                    tab.selected_xml_node == Some(node_id),
+                                    format!("<>  {path}"),
+                                )
+                                .clicked()
+                            {
+                                selected = Some(node_id);
+                            }
+                        }
+                        if tab.xml_filter_matches.len() >= JSON_FILTER_MAX_RESULTS {
+                            ui.label(
+                                RichText::new(format!("仅显示前 {JSON_FILTER_MAX_RESULTS} 个匹配"))
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        } else if tab.xml_filter_matches.is_empty() {
+                            ui.label("结构索引中没有匹配；按 Enter 可启动全文件标签搜索");
+                        }
+                    }
+                });
+
+            if (jump_requested || jump_clicked) && !tab.xml_filter.trim().is_empty() {
+                let query = tab.xml_filter.trim();
+                selected = outline
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .position(|(id, _)| outline.label(id) == query)
+                    .or_else(|| {
+                        outline.nodes.iter().enumerate().position(|(id, _)| {
+                            contains_ascii_case_insensitive(outline.label(id), query)
+                        })
+                    });
+                if selected.is_none() {
+                    tab.query = format!("<{}", tab.xml_filter.trim());
+                    tab.refresh_highlights();
+                    tab.start_search(ui.ctx());
+                    tab.status_message = "结构索引中未找到，已启动全文件 XML 标签搜索".into();
+                }
+            }
+        } else if tab.xml_index_task.is_none() && tab.xml_index_error.is_none() {
+            ui.label("等待 XML 结构索引启动…");
+        }
+        if (jump_requested || jump_clicked)
+            && tab.xml_outline.is_none()
+            && !tab.xml_filter.trim().is_empty()
+        {
+            tab.query = format!("<{}", tab.xml_filter.trim());
+            tab.refresh_highlights();
+            tab.start_search(ui.ctx());
+            tab.status_message = "XML 结构尚不可用，已启动全文件标签搜索".into();
+        }
+
+        if let Some(node_id) = selected
+            && let Some(outline) = &tab.xml_outline
+            && let Some(node) = outline.nodes.get(node_id)
+        {
+            let offset = node.byte_start;
+            let label = outline.label(node_id).to_owned();
+            tab.jump_to_xml_node(node_id, offset, &label);
+        }
+    }
+
     fn show_compare(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         section_title(ui, "文件对比");
         let left_label = self
@@ -1419,8 +3150,26 @@ impl NkgApp {
                 .small()
                 .color(theme::MUTED),
         );
+        if let Some(kind) = diff.structured_kind {
+            ui.colored_label(theme::JSON_KEY, kind.label());
+        }
 
-        if let Some((compared, total)) = diff.block_progress {
+        if let Some((processed, total)) = diff.structured_progress {
+            let ratio = if total == 0 {
+                1.0
+            } else {
+                processed as f32 / total as f32
+            };
+            ui.add(
+                egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
+                    .text(format!(
+                        "规范化 {} / {}",
+                        format_bytes(processed),
+                        format_bytes(total)
+                    ))
+                    .animate(diff.structured_prepare_task.is_some()),
+            );
+        } else if let Some((compared, total)) = diff.block_progress {
             let ratio = if total == 0 {
                 1.0
             } else {
@@ -1440,16 +3189,30 @@ impl NkgApp {
         let run_count = diff
             .block_summary
             .as_ref()
-            .map_or(0, |summary| summary.runs.len());
-        ui.label(format!("发现 {run_count} 处差异"));
+            .map_or(0, block_difference_count);
+        ui.label(format!(
+            "发现 {run_count} 处{}差异",
+            if diff.structured_kind.is_some() {
+                "结构"
+            } else {
+                ""
+            }
+        ));
         let mut selected_run = None;
         if let Some(summary) = &diff.block_summary {
+            let difference_runs = summary
+                .runs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, run)| (run.kind != BlockDiffKind::Equal).then_some(index))
+                .collect::<Vec<_>>();
             ScrollArea::vertical().id_salt("block_diff_runs").show_rows(
                 ui,
                 22.0,
-                summary.runs.len(),
+                difference_runs.len(),
                 |ui, rows| {
-                    for index in rows {
+                    for row in rows {
+                        let index = difference_runs[row];
                         let run = &summary.runs[index];
                         let icon = match run.kind {
                             BlockDiffKind::Equal => "＝",
@@ -1500,7 +3263,11 @@ impl NkgApp {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (index, tab) in self.tabs.iter().enumerate() {
                     let selected = index == self.active_tab;
-                    let name = tab.name();
+                    let name = if tab.dirty() {
+                        format!("{} ●", tab.name())
+                    } else {
+                        tab.name()
+                    };
                     let path = tab.path.display().to_string();
                     let font_id = TextStyle::Button.resolve(ui.style());
                     let text_color = if selected {
@@ -1672,11 +3439,12 @@ impl NkgApp {
                     Sense::click_and_drag(),
                 );
                 let file_len = tab.document.len();
-                let mut ratio = if tab.document.is_empty() {
+                let committed_ratio = if tab.document.is_empty() {
                     0.0
                 } else {
                     (tab.requested_offset as f64 / file_len as f64).clamp(0.0, 1.0)
                 };
+                let mut ratio = tab.overview_drag_ratio.unwrap_or(committed_ratio);
 
                 let row_height = ui.text_style_height(&TextStyle::Monospace) + 4.0;
                 let visible_lines = if tab.editor_visible_line_capacity == 0 {
@@ -1708,8 +3476,9 @@ impl NkgApp {
                     } else {
                         thumb_height / 2.0
                     });
+                    tab.overview_drag_ratio = Some(ratio);
                 }
-                if (response.dragged() || response.clicked())
+                if response.dragged()
                     && let Some(pointer) = response.interact_pointer_pos()
                 {
                     let grab_offset = tab.overview_drag_offset.unwrap_or(thumb_height / 2.0);
@@ -1718,10 +3487,24 @@ impl NkgApp {
                     } else {
                         ((pointer.y - grab_offset - track.top()) / travel).clamp(0.0, 1.0) as f64
                     };
+                    tab.overview_drag_ratio = Some(ratio);
+                } else if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    ratio = if travel <= f32::EPSILON {
+                        0.0
+                    } else {
+                        ((pointer.y - thumb_height * 0.5 - track.top()) / travel).clamp(0.0, 1.0)
+                            as f64
+                    };
                     tab.load_overview_position(ratio);
                 }
                 if response.drag_stopped() {
                     tab.overview_drag_offset = None;
+                    if let Some(target_ratio) = tab.overview_drag_ratio.take() {
+                        ratio = target_ratio;
+                        tab.load_overview_position(target_ratio);
+                    }
                 }
 
                 let thumb_top = track.top() + travel * ratio as f32;
@@ -1767,7 +3550,7 @@ impl NkgApp {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new("面向上百 GB 文本的只读查看、搜索与对比工具")
+                                RichText::new("面向上百 GB 文本的查看、补丁编辑、搜索与对比工具")
                                     .size(HOME_SUBTITLE_SIZE)
                                     .color(theme::MUTED),
                             );
@@ -1795,6 +3578,7 @@ impl NkgApp {
                     return;
                 };
 
+                show_document_bars(ui, tab);
                 show_text_window(ui, tab);
             });
     }
@@ -1873,11 +3657,17 @@ impl NkgApp {
                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        ui.label(format!(
-                            "{}  ⇄  {}",
-                            diff.left_path.display(),
-                            diff.right_path.display()
-                        ));
+                        ui.horizontal(|ui| {
+                            if let Some(kind) = diff.structured_kind {
+                                ui.colored_label(theme::JSON_KEY, kind.label());
+                                ui.separator();
+                            }
+                            ui.label(format!(
+                                "{}  ⇄  {}",
+                                diff.left_path.display(),
+                                diff.right_path.display()
+                            ));
+                        });
                     });
                 show_diff_navigation(ui, diff);
                 ui.separator();
@@ -1906,7 +3696,27 @@ impl NkgApp {
                         return;
                     }
                     if let Some(tab) = self.active() {
-                        ui.label(&tab.status_message);
+                        if let Some((saved, total)) = tab.save_progress {
+                            ui.label(format!(
+                                "正在保存副本 {:.1}% · {}",
+                                percent(saved, total),
+                                tab.status_message
+                            ));
+                        } else if let Some((scanned, total)) = tab.json_format_progress {
+                            ui.label(format!(
+                                "正在格式化单行 JSON {:.1}% · {}",
+                                percent(scanned, total),
+                                tab.status_message
+                            ));
+                        } else if let Some((scanned, total)) = tab.xml_format_progress {
+                            ui.label(format!(
+                                "正在格式化单行 XML {:.1}% · {}",
+                                percent(scanned, total),
+                                tab.status_message
+                            ));
+                        } else {
+                            ui.label(&tab.status_message);
+                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let index = tab.document.index_status();
                             ui.label(index_label(index));
@@ -1914,10 +3724,12 @@ impl NkgApp {
                             ui.label(format!(
                                 "{} · {}",
                                 format_bytes(tab.document.len()),
-                                if tab.document.snapshot().readonly {
-                                    "文件只读"
+                                if tab.edit_mode {
+                                    format!("编辑模式 · {} 行修改", tab.edits.len())
+                                } else if tab.document.snapshot().readonly {
+                                    "文件只读".into()
                                 } else {
-                                    "查看器只读"
+                                    "查看模式".into()
                                 }
                             ));
                         });
@@ -1931,13 +3743,44 @@ impl NkgApp {
 
 impl eframe::App for NkgApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = root.ctx().clone();
+        if context.input(|input| input.viewport().close_requested())
+            && self.tabs.iter().any(DocumentView::dirty)
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.global_message = "仍有未保存修改；已取消关闭窗口".into();
+            let message = self.global_message.clone();
+            if let Some(tab) = self.active_mut() {
+                tab.status_message = message;
+            }
+        }
         for tab in &mut self.tabs {
             tab.poll_background();
         }
-        if let Some(diff) = &mut self.diff {
-            diff.poll_background();
+        let comparison_stale = self.search_comparison.as_ref().is_some_and(|comparison| {
+            !search_comparison_source_is_current(&self.tabs, &comparison.left)
+                || !search_comparison_source_is_current(&self.tabs, &comparison.right)
+        });
+        if comparison_stale {
+            self.search_comparison = None;
+            self.global_message = "文档视图已切换，旧搜索结果对比已关闭".into();
         }
-        let context = root.ctx().clone();
+        if self
+            .search_comparison_left
+            .as_ref()
+            .is_some_and(|source| !search_comparison_source_is_current(&self.tabs, source))
+        {
+            self.search_comparison_left = None;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.ensure_json_format(&context);
+            tab.ensure_json_index(&context);
+            tab.ensure_xml_format(&context);
+            tab.ensure_xml_index(&context);
+        }
+        if let Some(diff) = &mut self.diff {
+            diff.poll_background(&context);
+        }
         self.handle_file_drop(&context);
         self.keyboard_shortcuts(&context);
         self.show_top_bar(root);
@@ -1949,7 +3792,11 @@ impl eframe::App for NkgApp {
         self.show_editor(root);
         self.show_file_drop_overlay(&context);
         show_window_resize_handles(root);
-        context.request_repaint_after(Duration::from_millis(200));
+        let background_active = self.tabs.iter().any(DocumentView::background_active)
+            || self.diff.as_ref().is_some_and(DiffView::background_active);
+        if background_active {
+            context.request_repaint_after(Duration::from_millis(200));
+        }
     }
 }
 
@@ -2131,6 +3978,51 @@ fn read_window(document: &TextDocument, offset: u64) -> Result<TextWindow, Strin
         .map_err(|error| error.to_string())
 }
 
+fn read_exact_window(document: &TextDocument, offset: u64) -> Result<TextWindow, String> {
+    document
+        .read_window(
+            offset,
+            ReadWindowOptions {
+                max_bytes: VIEW_BYTES,
+                max_lines: VIEW_LINES,
+                alignment: WindowAlignment::Exact,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn read_centered_window(document: &TextDocument, offset: u64) -> Result<TextWindow, String> {
+    let offset = offset.min(document.len());
+    if offset == 0 {
+        return read_window(document, 0);
+    }
+
+    let context = document
+        .read_window_before(
+            offset,
+            ReadWindowOptions {
+                max_bytes: (VIEW_BYTES / 2).max(1),
+                max_lines: (VIEW_LINES / 2).max(1),
+                alignment: WindowAlignment::Exact,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+    document
+        .read_window(
+            context.start_offset.min(offset),
+            ReadWindowOptions {
+                max_bytes: VIEW_BYTES,
+                max_lines: VIEW_LINES,
+                alignment: WindowAlignment::Exact,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn read_diff_window(document: &TextDocument, offset: u64) -> Result<TextWindow, String> {
     document
         .read_window(
@@ -2234,16 +4126,18 @@ fn show_diff_window(ui: &mut egui::Ui, diff: &mut DiffView) {
             let total_width = ui.available_width();
             let cell_width = ((total_width - 6.0) / 2.0).max(120.0);
             ui.horizontal(|ui| {
-                show_diff_cell(
+                let _ = show_diff_cell(
                     ui,
                     cell_width,
+                    row_height,
                     row.kind,
                     row.left_line
                         .and_then(|line| diff.left_window.lines.get(line)),
                 );
-                show_diff_cell(
+                let _ = show_diff_cell(
                     ui,
                     cell_width,
+                    row_height,
                     row.kind,
                     row.right_line
                         .and_then(|line| diff.right_window.lines.get(line)),
@@ -2256,9 +4150,10 @@ fn show_diff_window(ui: &mut egui::Ui, diff: &mut DiffView) {
 fn show_diff_cell(
     ui: &mut egui::Ui,
     width: f32,
+    row_height: f32,
     kind: WindowDiffKind,
     line: Option<&nkg_text_engine::LineSlice>,
-) {
+) -> egui::Response {
     let background = match kind {
         WindowDiffKind::Equal => theme::BACKGROUND,
         WindowDiffKind::Replace => theme::DIFF_REPLACE,
@@ -2271,6 +4166,7 @@ fn show_diff_cell(
         .show(ui, |ui| {
             ui.set_min_width(width - 8.0);
             ui.set_max_width(width - 8.0);
+            ui.set_min_height((row_height - 2.0).max(0.0));
             ui.horizontal(|ui| {
                 let number = line
                     .and_then(|line| line.line_number)
@@ -2301,7 +4197,8 @@ fn show_diff_cell(
                     ui.label("");
                 }
             });
-        });
+        })
+        .response
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2394,21 +4291,35 @@ fn show_search_comparison(
                         Vec::new()
                     }
                 };
-                let left_previews = left_hits
-                    .iter()
-                    .map(|hit| build_search_preview(&comparison.left.document, *hit))
-                    .collect::<Vec<_>>();
-                let right_previews = right_hits
-                    .iter()
-                    .map(|hit| build_search_preview(&comparison.right.document, *hit))
-                    .collect::<Vec<_>>();
+                let mut left_previews = comparison
+                    .left
+                    .preview_cache
+                    .lock()
+                    .expect("left search preview cache poisoned");
+                cache_search_previews(
+                    &mut left_previews,
+                    &comparison.left.document,
+                    start,
+                    &left_hits,
+                );
+                let mut right_previews = comparison
+                    .right
+                    .preview_cache
+                    .lock()
+                    .expect("right search preview cache poisoned");
+                cache_search_previews(
+                    &mut right_previews,
+                    &comparison.right.document,
+                    start,
+                    &right_hits,
+                );
 
                 for relative in 0..count {
                     let result_index = start + relative as u64;
                     let left_hit = left_hits.get(relative).copied();
                     let right_hit = right_hits.get(relative).copied();
-                    let left_preview = left_previews.get(relative);
-                    let right_preview = right_previews.get(relative);
+                    let left_preview = left_previews.get(&result_index);
+                    let right_preview = right_previews.get(&result_index);
                     let kind = search_comparison_row_kind(left_preview, right_preview);
                     let (left_width, right_width) =
                         search_comparison_pane_widths(ui.available_width());
@@ -2614,7 +4525,7 @@ fn show_search_comparison_cell(
                     .truncate()
                     .selectable(true),
             )
-            .on_hover_text(&preview.text);
+            .on_hover_text(preview.text.as_ref());
         },
     );
     jump
@@ -2764,25 +4675,23 @@ fn show_search_results(
                     continue;
                 }
             };
+            let mut preview_cache = session
+                .preview_cache
+                .lock()
+                .expect("search preview cache poisoned");
+            cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
             for (relative, hit) in hits.into_iter().enumerate() {
                 let hit_index = first_hit + relative as u64;
-                let preview = if let Some(preview) = session.preview_cache.get(&hit_index) {
-                    preview.clone()
-                } else {
-                    let preview = build_search_preview(&document, hit);
-                    if session.preview_cache.len() >= SEARCH_PREVIEW_CACHE_LIMIT {
-                        session.preview_cache.clear();
-                    }
-                    session.preview_cache.insert(hit_index, preview.clone());
-                    preview
-                };
+                let preview = preview_cache
+                    .get(&hit_index)
+                    .expect("visible search preview was cached");
                 let is_selected =
                     search_select_all || selected_search_hit == Some((session.id, hit_index));
                 let action = show_search_result_row(
                     ui,
                     session.id,
                     hit_index,
-                    &preview,
+                    preview,
                     is_selected,
                     search_viewport_width,
                 );
@@ -2838,6 +4747,7 @@ fn show_search_results(
                 document: Arc::clone(&tab.document),
                 query: session.query.clone(),
                 store: Arc::clone(&session.store),
+                preview_cache: Arc::clone(&session.preview_cache),
             })
     })
 }
@@ -2952,8 +4862,31 @@ fn show_search_session_header(
     action
 }
 
+fn cache_search_previews(
+    cache: &mut HashMap<u64, SearchPreview>,
+    document: &TextDocument,
+    start: u64,
+    hits: &[SearchHit],
+) {
+    let missing = hits
+        .iter()
+        .enumerate()
+        .filter(|(relative, _)| !cache.contains_key(&start.saturating_add(*relative as u64)))
+        .count();
+    if cache.len().saturating_add(missing) > SEARCH_PREVIEW_CACHE_LIMIT {
+        cache.clear();
+    }
+    for (relative, hit) in hits.iter().copied().enumerate() {
+        let hit_index = start.saturating_add(relative as u64);
+        if cache.contains_key(&hit_index) {
+            continue;
+        }
+        cache.insert(hit_index, build_search_preview(document, hit));
+    }
+}
+
 fn build_search_preview(document: &TextDocument, hit: SearchHit) -> SearchPreview {
-    const BEFORE_BYTES: u64 = 8 * 1024;
+    const BEFORE_BYTES: u64 = 4 * 1024;
     let read_start = hit.byte_start.saturating_sub(BEFORE_BYTES);
     let mut buffer = vec![0_u8; SEARCH_PREVIEW_BYTES];
     let bytes_read = document
@@ -3006,9 +4939,9 @@ fn build_search_preview(document: &TextDocument, hit: SearchHit) -> SearchPrevie
 
     SearchPreview {
         line_number: document
-            .line_number_at(hit.byte_start, 16 * 1024 * 1024)
+            .line_number_at(hit.byte_start, SEARCH_PREVIEW_LINE_SCAN_BYTES)
             .unwrap_or(None),
-        text,
+        text: Arc::from(text),
         match_range,
         byte_start: hit.byte_start,
     }
@@ -3158,6 +5091,7 @@ fn search_preview_layout(preview: &SearchPreview, text_color: Color32) -> Layout
 
 fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     let row_height = ui.text_style_height(&TextStyle::Monospace) + 4.0;
+    tab.editor_row_height = row_height;
     let scroll_height = (ui.available_height() - HORIZONTAL_SCROLLBAR_HEIGHT).max(row_height);
     let total_rows = tab.window.lines.len();
     let scroll_to_bottom = std::mem::take(&mut tab.editor_stick_to_bottom);
@@ -3165,6 +5099,16 @@ fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     let query = &tab.query;
     let selected_editor_line = tab.selected_editor_line;
     let editor_select_all = tab.editor_select_all;
+    let edits = &tab.edits;
+    let syntax = if tab.is_json {
+        DocumentSyntax::Json
+    } else if tab.is_xml {
+        DocumentSyntax::Xml
+    } else {
+        DocumentSyntax::Plain
+    };
+    let edit_mode = tab.edit_mode;
+    let center_offset = tab.editor_center_offset.take();
     let mut visible_rows = 0..0;
     let mut selected_line = None;
     let mut began_text_selection = false;
@@ -3184,13 +5128,51 @@ fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     } else if let Some(offset) = tab.editor_scroll_offset.take() {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
+    if let Some(offset) = center_offset
+        && let Some(target_row) = tab
+            .window
+            .lines
+            .iter()
+            .position(|line| line.byte_start <= offset && offset < line.byte_end)
+    {
+        let target_center = (target_row as f32 + 0.5) * row_height;
+        scroll_area =
+            scroll_area.vertical_scroll_offset((target_center - scroll_height * 0.5).max(0.0));
+    }
     ui.spacing_mut().item_spacing.y = 0.0;
     let output = scroll_area.show_rows(ui, row_height, total_rows, |ui, rows| {
         visible_rows = rows.clone();
         for row in rows {
             let line = &tab.window.lines[row];
             let is_selected = editor_select_all || selected_editor_line == Some(line.byte_start);
-            let action = show_text_row(ui, line, row, row_height, highlights, query, is_selected);
+            let edited_text = edits
+                .get(&line.byte_start)
+                .map(|patch| patch.replacement.replace(['\r', '\n'], " ↵ "));
+            let text = edited_text.as_deref().unwrap_or(line.text.as_str());
+            let line_highlights = if edited_text.is_some() {
+                &[][..]
+            } else {
+                highlights.as_slice()
+            };
+            let action = show_text_row(
+                ui,
+                line,
+                row,
+                row_height,
+                TextRowOptions {
+                    text,
+                    highlights: line_highlights,
+                    query,
+                    selected: is_selected,
+                    modified: edited_text.is_some(),
+                    syntax: if is_selected {
+                        DocumentSyntax::Plain
+                    } else {
+                        syntax
+                    },
+                    edit_mode,
+                },
+            );
             if action.select_line {
                 selected_line = Some(line.byte_start);
             }
@@ -3241,6 +5223,154 @@ fn show_text_window(ui: &mut egui::Ui, tab: &mut DocumentView) {
     } else if hovered && approaching_start && scroll_delta > 0.0 && tab.window.start_offset > 0 {
         tab.continue_backward(row_height);
     }
+    if hovered && scroll_delta.abs() > f32::EPSILON {
+        tab.selected_json_node = None;
+        tab.selected_xml_node = None;
+    }
+}
+
+fn show_document_bars(ui: &mut egui::Ui, tab: &mut DocumentView) {
+    if tab.is_json
+        && let Some(outline) = &tab.json_outline
+    {
+        let current = tab
+            .selected_json_node
+            .filter(|node_id| *node_id < outline.nodes.len())
+            .or_else(|| outline.node_at_or_before(tab.requested_offset));
+        if let Some(current) = current {
+            let path = outline.path(current);
+            let mut jump = None;
+            egui::Frame::NONE
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("json_breadcrumb", &tab.path))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("{}").color(theme::JSON_KEY));
+                                for (position, node_id) in path.iter().copied().enumerate() {
+                                    if position > 0 {
+                                        ui.label(RichText::new("›").color(theme::MUTED));
+                                    }
+                                    let node = &outline.nodes[node_id];
+                                    if ui
+                                        .button(format!(
+                                            "{} {}",
+                                            node.kind.icon(),
+                                            outline.label(node_id)
+                                        ))
+                                        .on_hover_text(format!("跳转到字节 {}", node.byte_start))
+                                        .clicked()
+                                    {
+                                        jump = Some((node_id, node.byte_start));
+                                    }
+                                }
+                            });
+                        });
+                });
+            if let Some((node_id, offset)) = jump {
+                let label = outline.label(node_id).to_owned();
+                tab.jump_to_json_node(node_id, offset, &label);
+            }
+        }
+    }
+
+    if tab.is_xml
+        && let Some(outline) = &tab.xml_outline
+    {
+        let current = tab
+            .selected_xml_node
+            .filter(|node_id| *node_id < outline.nodes.len())
+            .or_else(|| outline.node_at_or_before(tab.requested_offset));
+        if let Some(current) = current {
+            let path = outline.path(current);
+            let mut jump = None;
+            egui::Frame::NONE
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("xml_breadcrumb", &tab.path))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (position, node_id) in path.iter().copied().enumerate() {
+                                    if position > 0 {
+                                        ui.label(RichText::new("›").color(theme::MUTED));
+                                    }
+                                    let node = &outline.nodes[node_id];
+                                    if ui
+                                        .button(format!("<{}>", outline.label(node_id)))
+                                        .on_hover_text(format!("跳转到字节 {}", node.byte_start))
+                                        .clicked()
+                                    {
+                                        jump = Some((node_id, node.byte_start));
+                                    }
+                                }
+                            });
+                        });
+                });
+            if let Some((node_id, offset)) = jump {
+                let label = outline.label(node_id).to_owned();
+                tab.jump_to_xml_node(node_id, offset, &label);
+            }
+        }
+    }
+
+    if !tab.edit_mode {
+        return;
+    }
+    egui::Frame::NONE
+        .fill(theme::PANEL)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("编辑补丁：{} 行", tab.edits.len()))
+                        .strong()
+                        .color(theme::WARNING),
+                );
+                if ui
+                    .add_enabled(tab.editing_line.is_some(), egui::Button::new("撤销当前行"))
+                    .clicked()
+                {
+                    tab.revert_current_edit();
+                }
+                if ui
+                    .add_enabled(!tab.edits.is_empty(), egui::Button::new("撤销全部"))
+                    .clicked()
+                {
+                    tab.clear_all_edits();
+                }
+                ui.label(
+                    RichText::new("Ctrl+Shift+S 保存副本")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            });
+            if let Some(byte_start) = tab.editing_line {
+                ui.label(
+                    RichText::new(format!("原文件字节 {byte_start}；允许输入换行"))
+                        .small()
+                        .color(theme::MUTED),
+                );
+                if egui::TextEdit::multiline(&mut tab.edit_buffer)
+                    .font(TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .show(ui)
+                    .response
+                    .changed()
+                {
+                    tab.update_current_edit();
+                }
+            } else {
+                ui.label("点击正文行号选择要编辑的完整文本行");
+            }
+        });
 }
 
 fn show_horizontal_scrollbar(
@@ -3351,39 +5481,48 @@ struct TextRowAction {
     begin_text_selection: bool,
 }
 
+struct TextRowOptions<'a> {
+    text: &'a str,
+    highlights: &'a [HighlightSpan],
+    query: &'a str,
+    selected: bool,
+    modified: bool,
+    syntax: DocumentSyntax,
+    edit_mode: bool,
+}
+
 fn show_text_row(
     ui: &mut egui::Ui,
     line: &nkg_text_engine::LineSlice,
     line_index: usize,
     row_height: f32,
-    highlights: &[HighlightSpan],
-    query: &str,
-    selected: bool,
+    options: TextRowOptions<'_>,
 ) -> TextRowAction {
-    let text_color = if selected {
+    let text_color = if options.selected {
         theme::TEXT_ON_SELECTION
     } else {
         theme::TEXT
     };
-    let secondary_text_color = if selected {
+    let secondary_text_color = if options.selected {
         theme::MUTED_ON_SELECTION
     } else {
         theme::MUTED
     };
     let job = line_layout_job(
-        line.text.as_str(),
+        options.text,
         line_index,
-        highlights,
-        query,
+        options.highlights,
+        options.query,
         text_color,
         secondary_text_color,
+        options.syntax,
     );
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     let spacing = ui.spacing().item_spacing.x;
     let minimum_width = EDITOR_GUTTER_WIDTH + spacing + galley.size().x;
     let row_width = ui.available_width().max(minimum_width).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::hover());
-    if selected {
+    if options.selected {
         ui.painter().rect_filled(rect, 0.0, theme::SELECTED_LINE);
     }
 
@@ -3404,9 +5543,17 @@ fn show_text_row(
     ui.painter().text(
         number_rect.right_center(),
         egui::Align2::RIGHT_CENTER,
-        format!("{line_number:>9}"),
+        if options.modified {
+            format!("{line_number:>7} ●")
+        } else {
+            format!("{line_number:>9}")
+        },
         FontId::monospace(13.0),
-        secondary_text_color,
+        if options.modified {
+            theme::WARNING
+        } else {
+            secondary_text_color
+        },
     );
 
     let galley_pos = egui::pos2(
@@ -3423,7 +5570,8 @@ fn show_text_row(
     );
 
     TextRowAction {
-        select_line: number_response.clicked(),
+        select_line: number_response.clicked()
+            || (options.edit_mode && text_response.double_clicked()),
         begin_text_selection: text_response.clicked() || text_response.drag_started(),
     }
 }
@@ -3435,41 +5583,31 @@ fn line_layout_job(
     query: &str,
     text_color: Color32,
     secondary_text_color: Color32,
+    syntax: DocumentSyntax,
 ) -> LayoutJob {
     let display_end = floor_char_boundary(text, text.len().min(MAX_DISPLAY_LINE_BYTES));
     let displayed = &text[..display_end];
-    let normal = TextFormat {
-        font_id: FontId::monospace(13.0),
-        color: text_color,
-        ..Default::default()
-    };
-    let marked = TextFormat {
-        font_id: FontId::monospace(13.0),
-        color: Color32::WHITE,
-        background: theme::HIGHLIGHT,
-        ..Default::default()
-    };
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
 
-    if query.is_empty() {
-        job.append(displayed, 0.0, normal);
+    let displays_nul_run =
+        !displayed.is_empty() && displayed.as_bytes().iter().all(|byte| *byte == 0);
+    if displays_nul_run {
+        job.append(
+            "〈连续 NUL 字节区域〉",
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(13.0),
+                color: secondary_text_color,
+                ..Default::default()
+            },
+        );
+    } else if syntax == DocumentSyntax::Json {
+        append_json_syntax(&mut job, displayed, text_color);
+    } else if syntax == DocumentSyntax::Xml {
+        append_xml_syntax(&mut job, displayed, text_color);
     } else {
-        let mut cursor = 0;
-        for span in highlights
-            .iter()
-            .filter(|span| span.line_index == line_index)
-        {
-            let start = span.rendered_byte_start.min(display_end);
-            let end = span.rendered_byte_end.min(display_end);
-            if start < cursor || start >= end {
-                continue;
-            }
-            job.append(&displayed[cursor..start], 0.0, normal.clone());
-            job.append(&displayed[start..end], 0.0, marked.clone());
-            cursor = end;
-        }
-        job.append(&displayed[cursor..], 0.0, normal);
+        append_plain_text_syntax(&mut job, displayed, text_color);
     }
     if display_end < text.len() {
         job.append(
@@ -3482,7 +5620,439 @@ fn line_layout_job(
             },
         );
     }
+    if !query.is_empty() && !displays_nul_run {
+        overlay_search_highlights(&mut job, line_index, highlights, display_end);
+    }
     job
+}
+
+fn overlay_search_highlights(
+    job: &mut LayoutJob,
+    line_index: usize,
+    highlights: &[HighlightSpan],
+    display_end: usize,
+) {
+    let mut ranges = Vec::<std::ops::Range<usize>>::new();
+    let first = highlights.partition_point(|span| span.line_index < line_index);
+    let line_highlights =
+        &highlights[first..highlights.partition_point(|span| span.line_index <= line_index)];
+    for span in line_highlights {
+        let start = span.rendered_byte_start.min(display_end);
+        let end = span.rendered_byte_end.min(display_end);
+        if start >= end || !job.text.is_char_boundary(start) || !job.text.is_char_boundary(end) {
+            continue;
+        }
+        if let Some(previous) = ranges.last_mut()
+            && start <= previous.end
+        {
+            previous.end = previous.end.max(end);
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    if ranges.is_empty() {
+        return;
+    }
+
+    let base = std::mem::take(job);
+    let mut styled = base.clone();
+    styled.text.clear();
+    styled.sections.clear();
+    for section in &base.sections {
+        let section_start = section.byte_range.start.0;
+        let section_end = section.byte_range.end.0;
+        let mut cursor = section_start;
+        let mut leading_space = section.leading_space;
+        for range in &ranges {
+            let start = range.start.max(section_start);
+            let end = range.end.min(section_end);
+            if start >= end {
+                continue;
+            }
+            if cursor < start {
+                styled.append(
+                    &base.text[cursor..start],
+                    leading_space,
+                    section.format.clone(),
+                );
+                leading_space = 0.0;
+            }
+            let mut marked = section.format.clone();
+            marked.background = theme::HIGHLIGHT;
+            styled.append(&base.text[start..end], leading_space, marked);
+            leading_space = 0.0;
+            cursor = end;
+        }
+        if cursor < section_end {
+            styled.append(
+                &base.text[cursor..section_end],
+                leading_space,
+                section.format.clone(),
+            );
+        }
+    }
+    *job = styled;
+}
+
+fn append_json_syntax(job: &mut LayoutJob, text: &str, default_color: Color32) {
+    let normal = TextFormat {
+        font_id: FontId::monospace(13.0),
+        color: default_color,
+        ..Default::default()
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            if cursor < index {
+                job.append(&text[cursor..index], 0.0, normal.clone());
+            }
+            let start = index;
+            index += 1;
+            let mut escaped = false;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    break;
+                }
+            }
+            let mut after = index;
+            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+                after += 1;
+            }
+            let color = if after < bytes.len() && bytes[after] == b':' {
+                theme::JSON_KEY
+            } else {
+                theme::JSON_STRING
+            };
+            job.append(
+                &text[start..index],
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(13.0),
+                    color,
+                    ..Default::default()
+                },
+            );
+            cursor = index;
+            continue;
+        }
+
+        let number_start = matches!(bytes[index], b'-' | b'0'..=b'9');
+        let literal_start = matches!(bytes[index], b't' | b'f' | b'n');
+        if number_start || literal_start {
+            if cursor < index {
+                job.append(&text[cursor..index], 0.0, normal.clone());
+            }
+            let start = index;
+            while index < bytes.len()
+                && !matches!(
+                    bytes[index],
+                    b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}' | b':'
+                )
+            {
+                index += 1;
+            }
+            job.append(
+                &text[start..index],
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(13.0),
+                    color: if number_start {
+                        theme::JSON_NUMBER
+                    } else {
+                        theme::JSON_LITERAL
+                    },
+                    ..Default::default()
+                },
+            );
+            cursor = index;
+            continue;
+        }
+        index += 1;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, normal);
+    }
+}
+
+fn append_xml_syntax(job: &mut LayoutJob, text: &str, default_color: Color32) {
+    let normal = TextFormat {
+        font_id: FontId::monospace(13.0),
+        color: default_color,
+        ..Default::default()
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        let Some(relative_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+            job.append(&text[cursor..], 0.0, normal);
+            return;
+        };
+        let tag_start = cursor + relative_start;
+        if cursor < tag_start {
+            job.append(&text[cursor..tag_start], 0.0, normal.clone());
+        }
+        if text[tag_start..].starts_with("<!--")
+            || text[tag_start..].starts_with("<![CDATA[")
+            || text[tag_start..].starts_with("<!DOCTYPE")
+        {
+            let marker = if text[tag_start..].starts_with("<!--") {
+                "-->"
+            } else if text[tag_start..].starts_with("<![CDATA[") {
+                "]]>"
+            } else {
+                ">"
+            };
+            let end = text[tag_start..]
+                .find(marker)
+                .map_or(text.len(), |relative| tag_start + relative + marker.len());
+            job.append(
+                &text[tag_start..end],
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(13.0),
+                    color: theme::JSON_LITERAL,
+                    ..Default::default()
+                },
+            );
+            cursor = end;
+            continue;
+        }
+
+        let mut index = tag_start + 1;
+        let mut quote = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(expected) = quote {
+                if byte == expected {
+                    quote = None;
+                }
+            } else if matches!(byte, b'"' | b'\'') {
+                quote = Some(byte);
+            } else if byte == b'>' {
+                index += 1;
+                break;
+            }
+            index += 1;
+        }
+        append_xml_tag_syntax(job, &text[tag_start..index], default_color);
+        cursor = index;
+    }
+}
+
+fn append_xml_tag_syntax(job: &mut LayoutJob, tag: &str, default_color: Color32) {
+    let normal = TextFormat {
+        font_id: FontId::monospace(13.0),
+        color: default_color,
+        ..Default::default()
+    };
+    let bytes = tag.as_bytes();
+    let mut index = if tag.starts_with("</") || tag.starts_with("<?") {
+        2
+    } else {
+        1
+    };
+    job.append(&tag[..index.min(tag.len())], 0.0, normal.clone());
+    let name_start = index;
+    while index < bytes.len()
+        && !matches!(
+            bytes[index],
+            b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>' | b'?'
+        )
+    {
+        index += 1;
+    }
+    if name_start < index {
+        job.append(
+            &tag[name_start..index],
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(13.0),
+                color: theme::JSON_KEY,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut cursor = index;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'"' | b'\'') {
+            if cursor < index {
+                append_xml_attribute_region(job, &tag[cursor..index], default_color);
+            }
+            let quote = bytes[index];
+            let start = index;
+            index += 1;
+            while index < bytes.len() && bytes[index] != quote {
+                index += 1;
+            }
+            if index < bytes.len() {
+                index += 1;
+            }
+            job.append(
+                &tag[start..index],
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(13.0),
+                    color: theme::JSON_STRING,
+                    ..Default::default()
+                },
+            );
+            cursor = index;
+        } else {
+            index += 1;
+        }
+    }
+    if cursor < tag.len() {
+        append_xml_attribute_region(job, &tag[cursor..], default_color);
+    }
+}
+
+fn append_xml_attribute_region(job: &mut LayoutJob, text: &str, default_color: Color32) {
+    let normal = TextFormat {
+        font_id: FontId::monospace(13.0),
+        color: default_color,
+        ..Default::default()
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'_' | b':') {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric()
+                    || matches!(bytes[index], b'_' | b':' | b'-' | b'.'))
+            {
+                index += 1;
+            }
+            let mut after = index;
+            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+                after += 1;
+            }
+            if after < bytes.len() && bytes[after] == b'=' {
+                if cursor < start {
+                    job.append(&text[cursor..start], 0.0, normal.clone());
+                }
+                job.append(
+                    &text[start..index],
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::monospace(13.0),
+                        color: theme::JSON_NUMBER,
+                        ..Default::default()
+                    },
+                );
+                cursor = index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, normal);
+    }
+}
+
+fn append_plain_text_syntax(job: &mut LayoutJob, text: &str, default_color: Color32) {
+    let normal = TextFormat {
+        font_id: FontId::monospace(13.0),
+        color: default_color,
+        ..Default::default()
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let (start, end, color) = if matches!(bytes[index], b'"' | b'\'') {
+            let quote = bytes[index];
+            let start = index;
+            index += 1;
+            let mut escaped = false;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    break;
+                }
+            }
+            (start, index, theme::JSON_STRING)
+        } else if bytes[index].is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_digit()
+                    || matches!(bytes[index], b'.' | b'-' | b'/' | b':' | b'+' | b'T' | b'Z'))
+            {
+                index += 1;
+            }
+            (start, index, theme::JSON_NUMBER)
+        } else if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric()
+                    || matches!(bytes[index], b'_' | b'-' | b'.'))
+            {
+                index += 1;
+            }
+            let token = &text[start..index];
+            let mut after = index;
+            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+                after += 1;
+            }
+            let color = if matches_ascii_case_insensitive(
+                token,
+                &["ERROR", "FATAL", "PANIC", "FAILED", "FAIL"],
+            ) {
+                theme::ERROR
+            } else if matches_ascii_case_insensitive(token, &["WARN", "WARNING"]) {
+                theme::WARNING
+            } else if matches_ascii_case_insensitive(token, &["INFO", "NOTICE"]) {
+                theme::JSON_LITERAL
+            } else if matches_ascii_case_insensitive(token, &["DEBUG", "TRACE"]) {
+                theme::MUTED
+            } else if token.len() > 1 && after < bytes.len() && matches!(bytes[after], b'=' | b':')
+            {
+                theme::JSON_KEY
+            } else {
+                continue;
+            };
+            (start, index, color)
+        } else {
+            index += 1;
+            continue;
+        };
+
+        if cursor < start {
+            job.append(&text[cursor..start], 0.0, normal.clone());
+        }
+        job.append(
+            &text[start..end],
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(13.0),
+                color,
+                ..Default::default()
+            },
+        );
+        cursor = end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, normal);
+    }
 }
 
 fn activity_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, selected: bool) -> bool {
@@ -3548,11 +6118,48 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|candidate| candidate.eq_ignore_ascii_case(needle))
+}
+
+fn matches_ascii_case_insensitive(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+fn structured_diff_kind(left: &Path, right: &Path) -> Option<StructuredDiffKind> {
+    let left_extension = left.extension()?.to_string_lossy();
+    let right_extension = right.extension()?.to_string_lossy();
+    if left_extension.eq_ignore_ascii_case("json") && right_extension.eq_ignore_ascii_case("json") {
+        Some(StructuredDiffKind::Json)
+    } else if left_extension.eq_ignore_ascii_case("xml")
+        && right_extension.eq_ignore_ascii_case("xml")
+    {
+        Some(StructuredDiffKind::Xml)
+    } else {
+        None
+    }
+}
+
+fn block_difference_count(summary: &BlockDiffSummary) -> usize {
+    summary
+        .runs
+        .iter()
+        .filter(|run| run.kind != BlockDiffKind::Equal)
+        .count()
 }
 
 #[cfg(test)]
@@ -3631,6 +6238,372 @@ mod tests {
     }
 
     #[test]
+    fn forward_scrolling_crosses_a_nul_run_larger_than_multiple_windows() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"before\n").unwrap();
+        file.write_all(&vec![0; VIEW_BYTES * 2 + 128]).unwrap();
+        file.write_all(b"\nafter\n").unwrap();
+        file.flush().unwrap();
+
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let mut previous_start = view.window.start_offset;
+        for _ in 0..8 {
+            if view.window.reached_end {
+                break;
+            }
+            let anchor_row = view.window.lines.len().saturating_sub(1);
+            view.continue_forward(anchor_row, 20.0);
+            assert!(view.window.start_offset > previous_start);
+            previous_start = view.window.start_offset;
+        }
+
+        assert!(view.window.reached_end);
+        assert!(view.window.lines.iter().any(|line| line.text == "after"));
+    }
+
+    #[test]
+    fn nul_only_display_prefix_is_rendered_as_a_visible_placeholder() {
+        let text = "\0".repeat(MAX_DISPLAY_LINE_BYTES + 1);
+        let job = line_layout_job(
+            &text,
+            0,
+            &[],
+            "",
+            Color32::WHITE,
+            Color32::GRAY,
+            DocumentSyntax::Plain,
+        );
+
+        assert!(job.text.contains("连续 NUL 字节区域"));
+        assert!(!job.text.contains('\0'));
+        assert!(job.text.contains("该行过长，显示已截断"));
+    }
+
+    #[test]
+    fn edit_mode_records_and_reverts_a_line_patch() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "alpha\r\nbeta\n").unwrap();
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+
+        view.toggle_edit_mode();
+        view.select_editor_line(0);
+        view.edit_buffer = "ALPHA\ninserted".into();
+        view.update_current_edit();
+
+        assert!(view.dirty());
+        assert_eq!(
+            view.edits.get(&0),
+            Some(&LinePatch {
+                original_end: 5,
+                replacement: "ALPHA\ninserted".into(),
+            })
+        );
+
+        view.revert_current_edit();
+        assert!(!view.dirty());
+        assert_eq!(view.edit_buffer, "alpha");
+    }
+
+    #[test]
+    fn page_navigation_moves_by_the_visible_line_capacity() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in 0..100 {
+            writeln!(file, "line-{line:03}").unwrap();
+        }
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        view.editor_visible_line_capacity = 10;
+        view.editor_row_height = 20.0;
+        view.visible_row = Some(0);
+
+        view.page_down();
+        assert_eq!(view.editor_scroll_offset, Some(180.0));
+        assert_eq!(view.requested_offset, view.window.lines[9].byte_start);
+
+        view.visible_row = Some(9);
+        view.page_up();
+        assert_eq!(view.editor_scroll_offset, Some(0.0));
+        assert_eq!(view.requested_offset, 0);
+    }
+
+    #[test]
+    fn json_lines_receive_key_string_number_and_literal_colors() {
+        let job = line_layout_job(
+            r#"{"name":"demo","size":42,"enabled":true}"#,
+            0,
+            &[],
+            "",
+            Color32::WHITE,
+            Color32::GRAY,
+            DocumentSyntax::Json,
+        );
+        let colors = job
+            .sections
+            .iter()
+            .map(|section| section.format.color)
+            .collect::<Vec<_>>();
+
+        assert!(colors.contains(&theme::JSON_KEY));
+        assert!(colors.contains(&theme::JSON_STRING));
+        assert!(colors.contains(&theme::JSON_NUMBER));
+        assert!(colors.contains(&theme::JSON_LITERAL));
+    }
+
+    #[test]
+    fn search_highlight_preserves_json_syntax_colors() {
+        let highlights = [HighlightSpan {
+            line_index: 0,
+            rendered_byte_start: 9,
+            rendered_byte_end: 13,
+            absolute_byte_start: Some(9),
+            absolute_byte_end: Some(13),
+        }];
+        let job = line_layout_job(
+            r#"{"name":"demo"}"#,
+            0,
+            &highlights,
+            "demo",
+            Color32::WHITE,
+            Color32::GRAY,
+            DocumentSyntax::Json,
+        );
+
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.color == theme::JSON_KEY)
+        );
+        assert!(job.sections.iter().any(|section| {
+            section.format.color == theme::JSON_STRING
+                && section.format.background == theme::HIGHLIGHT
+        }));
+    }
+
+    #[test]
+    fn xml_lines_receive_tag_and_attribute_value_colors() {
+        let job = line_layout_job(
+            r#"<item id="42">value</item>"#,
+            0,
+            &[],
+            "",
+            Color32::WHITE,
+            Color32::GRAY,
+            DocumentSyntax::Xml,
+        );
+        let colors = job
+            .sections
+            .iter()
+            .map(|section| section.format.color)
+            .collect::<Vec<_>>();
+
+        assert!(colors.contains(&theme::JSON_KEY));
+        assert!(colors.contains(&theme::JSON_STRING));
+    }
+
+    #[test]
+    fn plain_text_lines_color_log_levels_keys_strings_and_numbers() {
+        let job = line_layout_job(
+            r#"2026-07-31 INFO worker_id=42 message="ready""#,
+            0,
+            &[],
+            "",
+            Color32::WHITE,
+            Color32::GRAY,
+            DocumentSyntax::Plain,
+        );
+        let colors = job
+            .sections
+            .iter()
+            .map(|section| section.format.color)
+            .collect::<Vec<_>>();
+
+        assert!(colors.contains(&theme::JSON_NUMBER));
+        assert!(colors.contains(&theme::JSON_LITERAL));
+        assert!(colors.contains(&theme::JSON_KEY));
+        assert!(colors.contains(&theme::JSON_STRING));
+    }
+
+    #[test]
+    fn json_node_jump_selects_the_matching_editor_line() {
+        let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        write!(
+            file,
+            "{{\n  \"data\": [\n    {{\n      \"name\": \"x\",\n      \"totalSize\": 42\n    }}\n  ]\n}}"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let outline =
+            scan_json_outline(&view.document, &AtomicBool::new(false), |_, _| {}).unwrap();
+        let node_id = outline
+            .nodes
+            .iter()
+            .enumerate()
+            .position(|(id, _)| outline.label(id) == "totalSize")
+            .unwrap();
+        let offset = outline.nodes[node_id].byte_start;
+        let path = outline
+            .path(node_id)
+            .into_iter()
+            .map(|id| outline.label(id).to_owned())
+            .collect::<Vec<_>>();
+        view.json_outline = Some(outline);
+
+        view.jump_to_json_node(node_id, offset, "totalSize");
+
+        let selected_line = view.selected_editor_line.unwrap();
+        assert!(
+            view.window
+                .lines
+                .iter()
+                .find(|line| line.byte_start == selected_line)
+                .is_some_and(|line| line.text.contains("\"totalSize\""))
+        );
+        assert_eq!(view.selected_json_node, Some(node_id));
+        assert_eq!(path, ["$", "data", "[0]", "totalSize"]);
+    }
+
+    #[test]
+    fn selects_structured_comparison_for_matching_extensions() {
+        assert_eq!(
+            structured_diff_kind(Path::new("left.json"), Path::new("right.JSON")),
+            Some(StructuredDiffKind::Json)
+        );
+        assert_eq!(
+            structured_diff_kind(Path::new("left.xml"), Path::new("right.XML")),
+            Some(StructuredDiffKind::Xml)
+        );
+        assert_eq!(
+            structured_diff_kind(Path::new("left.json"), Path::new("right.xml")),
+            None
+        );
+    }
+
+    fn wait_for_structured_diff(diff: &mut DiffView, context: &egui::Context) {
+        for _ in 0..200 {
+            diff.poll_background(context);
+            if diff.structured_prepare_task.is_none() && diff.block_task.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("structured comparison did not finish");
+    }
+
+    #[test]
+    fn json_comparison_ignores_layout_only_changes() {
+        let mut left_file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        left_file.write_all(br#"{"a":1,"b":[true,null]}"#).unwrap();
+        left_file.flush().unwrap();
+        let mut right_file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        right_file
+            .write_all(b"{\n  \"a\": 1,\n  \"b\": [ true, null ]\n}")
+            .unwrap();
+        right_file.flush().unwrap();
+        let left = TextDocument::open(left_file.path()).unwrap();
+        let context = egui::Context::default();
+
+        let mut diff = DiffView::open(
+            left_file.path().to_path_buf(),
+            left,
+            right_file.path().to_path_buf(),
+            &context,
+        )
+        .unwrap();
+        wait_for_structured_diff(&mut diff, &context);
+
+        assert_eq!(diff.structured_kind, Some(StructuredDiffKind::Json));
+        assert_eq!(
+            block_difference_count(diff.block_summary.as_ref().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn json_comparison_reports_value_changes() {
+        let mut left_file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        left_file.write_all(br#"{"size":1}"#).unwrap();
+        left_file.flush().unwrap();
+        let mut right_file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        right_file.write_all(br#"{"size":2}"#).unwrap();
+        right_file.flush().unwrap();
+        let left = TextDocument::open(left_file.path()).unwrap();
+        let context = egui::Context::default();
+
+        let mut diff = DiffView::open(
+            left_file.path().to_path_buf(),
+            left,
+            right_file.path().to_path_buf(),
+            &context,
+        )
+        .unwrap();
+        wait_for_structured_diff(&mut diff, &context);
+
+        assert!(
+            block_difference_count(diff.block_summary.as_ref().unwrap()) > 0,
+            "JSON value changes must produce a structural difference"
+        );
+    }
+
+    #[test]
+    fn xml_comparison_ignores_layout_comments_and_attribute_order() {
+        let mut left_file = tempfile::Builder::new().suffix(".xml").tempfile().unwrap();
+        left_file
+            .write_all(br#"<root b="2" a="1"><!--x--><item>v</item></root>"#)
+            .unwrap();
+        left_file.flush().unwrap();
+        let mut right_file = tempfile::Builder::new().suffix(".xml").tempfile().unwrap();
+        right_file
+            .write_all(b"<root a=\"1\" b=\"2\">\n  <item>v</item>\n</root>")
+            .unwrap();
+        right_file.flush().unwrap();
+        let left = TextDocument::open(left_file.path()).unwrap();
+        let context = egui::Context::default();
+
+        let mut diff = DiffView::open(
+            left_file.path().to_path_buf(),
+            left,
+            right_file.path().to_path_buf(),
+            &context,
+        )
+        .unwrap();
+        wait_for_structured_diff(&mut diff, &context);
+
+        assert_eq!(diff.structured_kind, Some(StructuredDiffKind::Xml));
+        assert_eq!(
+            block_difference_count(diff.block_summary.as_ref().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn xml_comparison_reports_attribute_changes() {
+        let mut left_file = tempfile::Builder::new().suffix(".xml").tempfile().unwrap();
+        left_file.write_all(br#"<root id="1"/>"#).unwrap();
+        left_file.flush().unwrap();
+        let mut right_file = tempfile::Builder::new().suffix(".xml").tempfile().unwrap();
+        right_file.write_all(br#"<root id="2"/>"#).unwrap();
+        right_file.flush().unwrap();
+        let left = TextDocument::open(left_file.path()).unwrap();
+        let context = egui::Context::default();
+
+        let mut diff = DiffView::open(
+            left_file.path().to_path_buf(),
+            left,
+            right_file.path().to_path_buf(),
+            &context,
+        )
+        .unwrap();
+        wait_for_structured_diff(&mut diff, &context);
+
+        assert!(
+            block_difference_count(diff.block_summary.as_ref().unwrap()) > 0,
+            "XML attribute changes must produce a structural difference"
+        );
+    }
+
+    #[test]
     fn collapsed_search_sessions_remove_their_hits_from_virtual_height() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file, "needle\nnone\nneedle\nneedle\n").unwrap();
@@ -3659,7 +6632,7 @@ mod tests {
             result: Some(result),
             error: None,
             expanded: true,
-            preview_cache: HashMap::new(),
+            preview_cache: Arc::new(Mutex::new(HashMap::new())),
         }];
 
         assert_eq!(search_session_rows(&sessions).1, 4);
@@ -3764,6 +6737,37 @@ mod tests {
     }
 
     #[test]
+    fn jumping_to_search_hit_keeps_context_before_the_target_line() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut target_line_start = 0_u64;
+        for line in 0..3_000 {
+            let text = format!("line-{line:04}\n");
+            target_line_start += text.len() as u64;
+            write!(file, "{text}").unwrap();
+        }
+        writeln!(file, "prefix needle suffix").unwrap();
+        file.flush().unwrap();
+
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let hit = SearchHit {
+            byte_start: target_line_start + 7,
+            byte_end: target_line_start + 13,
+        };
+        view.jump_to_hit(hit);
+
+        let target_row = view
+            .window
+            .lines
+            .iter()
+            .position(|line| line.byte_start == target_line_start)
+            .expect("target line should be loaded");
+        assert!(target_row > 0);
+        assert_eq!(view.selected_editor_line, Some(target_line_start));
+        assert_eq!(view.editor_center_offset, Some(hit.byte_start));
+        assert_eq!(view.editor_scroll_offset, None);
+    }
+
+    #[test]
     fn search_comparison_accepts_same_file_and_cross_file_sessions() {
         let mut first_file = tempfile::NamedTempFile::new().unwrap();
         writeln!(first_file, "alpha").unwrap();
@@ -3848,6 +6852,23 @@ mod tests {
     }
 
     #[test]
+    fn diff_cell_occupies_the_virtualized_row_height() {
+        let context = egui::Context::default();
+        let actual_height = std::cell::Cell::new(0.0);
+        let expected_height = 24.0;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            actual_height.set(
+                show_diff_cell(ui, 320.0, expected_height, WindowDiffKind::Equal, None)
+                    .rect
+                    .height(),
+            );
+        });
+
+        assert!((actual_height.get() - expected_height).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn horizontal_scrollbar_thumb_tracks_the_visible_content_fraction() {
         let (max_offset, thumb_width, travel) =
             horizontal_scrollbar_geometry(500.0, 250.0, 1_000.0);
@@ -3870,6 +6891,7 @@ mod tests {
             document: TextDocument::open(path).unwrap(),
             query: query.into(),
             store: Arc::new(SearchHitStore::create().unwrap()),
+            preview_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

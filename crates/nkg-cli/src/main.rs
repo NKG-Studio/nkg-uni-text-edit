@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nkg_text_engine::{
-    BlockDiffOptions, CaseSensitivity, FileSource, ReadWindowOptions, SearchAllOptions,
-    SearchHitStore, SearchOptions, TextDocument, WindowAlignment, compare_blocks,
+    BlockDiffOptions, CaseSensitivity, DEFAULT_DIFF_BLOCK_BYTES, DEFAULT_SEARCH_CHUNK_BYTES,
+    FileSource, ReadWindowOptions, SearchAllOptions, SearchHitStore, SearchOptions, TextDocument,
+    WindowAlignment, compare_blocks,
 };
 use std::{
     fs::OpenOptions,
@@ -44,7 +45,7 @@ enum Command {
         ignore_ascii_case: bool,
         #[arg(long, default_value_t = 10_000)]
         max_results: usize,
-        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        #[arg(long, default_value_t = DEFAULT_SEARCH_CHUNK_BYTES)]
         chunk_bytes: usize,
     },
     /// 搜索全部命中并写入磁盘分页结果表。
@@ -55,7 +56,7 @@ enum Command {
         ignore_ascii_case: bool,
         #[arg(long, default_value_t = 10)]
         sample_results: usize,
-        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        #[arg(long, default_value_t = DEFAULT_SEARCH_CHUNK_BYTES)]
         chunk_bytes: usize,
     },
     /// 顺序构建稀疏行索引并报告成本。
@@ -69,7 +70,7 @@ enum Command {
     Compare {
         left: PathBuf,
         right: PathBuf,
-        #[arg(long, default_value_t = 1024 * 1024)]
+        #[arg(long, default_value_t = DEFAULT_DIFF_BLOCK_BYTES)]
         block_bytes: usize,
     },
     /// 创建用于随机跳转验收的稀疏大文件；目标必须不存在。
