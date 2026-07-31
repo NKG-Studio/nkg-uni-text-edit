@@ -14,7 +14,6 @@ const OUTLINE_LABEL_GROWTH: usize = 1024 * 1024;
 const MAX_JSON_NESTING_DEPTH: usize = 4_096;
 const MAX_FORMAT_EXPANSION: u64 = 8;
 const FORMAT_OUTPUT_HEADROOM: u64 = 16 * 1024 * 1024;
-const MAX_FORMAT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const INDENT_SPACES: [u8; 128] = [b' '; 128];
 const NO_NODE: u32 = u32::MAX;
 
@@ -53,8 +52,7 @@ pub fn format_json_to_temp(
     let mut pending_line_break = false;
     let output_limit = total
         .saturating_mul(MAX_FORMAT_EXPANSION)
-        .saturating_add(FORMAT_OUTPUT_HEADROOM)
-        .min(MAX_FORMAT_OUTPUT_BYTES);
+        .saturating_add(FORMAT_OUTPUT_HEADROOM);
 
     while cursor < total {
         if cancel.load(Ordering::Acquire) {

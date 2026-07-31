@@ -62,7 +62,6 @@ const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
 const STRUCTURE_TREE_PAGE_SIZE: usize = 1_000;
-const MAX_AUTO_FORMAT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
 fn file_overview_thumb_height(track_height: f32, visible_lines: u64, total_lines: u64) -> f32 {
@@ -635,11 +634,8 @@ impl DocumentView {
         let is_xml = path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"));
-        let auto_format_allowed = document.len() <= MAX_AUTO_FORMAT_BYTES;
-        let json_format_needed =
-            is_json && auto_format_allowed && !document.is_empty() && window.lines.len() <= 1;
-        let xml_format_needed =
-            is_xml && auto_format_allowed && !document.is_empty() && window.lines.len() <= 1;
+        let json_format_needed = is_json && !document.is_empty() && window.lines.len() <= 1;
+        let xml_format_needed = is_xml && !document.is_empty() && window.lines.len() <= 1;
         if !json_format_needed && !xml_format_needed {
             document.start_background_index();
         }
@@ -6224,7 +6220,31 @@ fn block_difference_count(summary: &BlockDiffSummary) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, sync::atomic::AtomicBool};
+    use std::{
+        fs::File,
+        io::{Seek, SeekFrom, Write},
+        sync::atomic::AtomicBool,
+    };
+
+    #[test]
+    fn large_single_line_json_still_requests_auto_format() {
+        const FORMER_AUTO_FORMAT_LIMIT: u64 = 256 * 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-single-line.json");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"[").unwrap();
+        file.seek(SeekFrom::Start(FORMER_AUTO_FORMAT_LIMIT))
+            .unwrap();
+        file.write_all(b"]").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let view = DocumentView::open(path).unwrap();
+
+        assert!(view.document.len() > FORMER_AUTO_FORMAT_LIMIT);
+        assert_eq!(view.window.lines.len(), 1);
+        assert!(view.json_format_needed);
+    }
 
     #[test]
     fn file_overview_thumb_uses_line_ratio_with_height_limits() {
