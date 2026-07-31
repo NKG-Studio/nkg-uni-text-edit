@@ -61,10 +61,8 @@ const HOME_SUBTITLE_SIZE: f32 = 16.0;
 const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
-const JSON_FILTER_MAX_RESULTS: usize = 200;
-const JSON_TREE_MAX_SIBLINGS: usize = 1_000;
+const STRUCTURE_TREE_PAGE_SIZE: usize = 1_000;
 const MAX_AUTO_FORMAT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_XML_OUTLINE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
 fn file_overview_thumb_height(track_height: f32, visible_lines: u64, total_lines: u64) -> f32 {
@@ -134,6 +132,23 @@ enum SidebarMode {
     Compare,
 }
 
+#[derive(Clone)]
+struct StructureTreePage {
+    start: usize,
+    number: usize,
+    previous_starts: Vec<usize>,
+}
+
+impl StructureTreePage {
+    fn new(start: usize) -> Self {
+        Self {
+            start,
+            number: 1,
+            previous_starts: Vec::new(),
+        }
+    }
+}
+
 fn toggle_sidebar_mode(
     visible: &mut bool,
     current_mode: &mut SidebarMode,
@@ -159,16 +174,28 @@ fn show_json_tree_node(
         return;
     };
     let label = format!("{}  {}", node.kind.icon(), outline.label(node_id));
-    if let Some(first_child) = outline.first_child(node_id)
-        && render_depth < 64
-    {
+    if let Some(first_child) = outline.first_child(node_id) {
         let response = egui::CollapsingHeader::new(label)
             .id_salt(("json_node", node_id))
             .default_open(render_depth == 0)
             .show(ui, |ui| {
-                let mut child = Some(first_child);
+                let page_id = ui.make_persistent_id((
+                    "json_sibling_page",
+                    outline.nodes.as_ptr() as usize,
+                    node_id,
+                ));
+                let mut page = ui
+                    .data_mut(|data| data.get_temp::<StructureTreePage>(page_id))
+                    .unwrap_or_else(|| StructureTreePage::new(first_child));
+                if page.start >= outline.nodes.len() {
+                    page = StructureTreePage::new(first_child);
+                }
+
+                let mut child = Some(page.start);
                 let mut shown = 0_usize;
-                while let Some(child_id) = child {
+                while let Some(child_id) = child
+                    && shown < STRUCTURE_TREE_PAGE_SIZE
+                {
                     show_json_tree_node(
                         ui,
                         outline,
@@ -179,17 +206,34 @@ fn show_json_tree_node(
                     );
                     child = outline.next_sibling(child_id);
                     shown += 1;
-                    if shown >= JSON_TREE_MAX_SIBLINGS {
-                        ui.label(
-                            RichText::new(format!(
-                                "该层仅显示前 {JSON_TREE_MAX_SIBLINGS} 个节点；可使用 Key 筛选"
-                            ))
-                            .small()
-                            .color(theme::MUTED),
-                        );
-                        break;
-                    }
                 }
+
+                if !page.previous_starts.is_empty() || child.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !page.previous_starts.is_empty(),
+                                egui::Button::new("上一页"),
+                            )
+                            .clicked()
+                            && let Some(previous_start) = page.previous_starts.pop()
+                        {
+                            page.start = previous_start;
+                            page.number = page.number.saturating_sub(1).max(1);
+                        }
+                        ui.label(format!("第 {} 页", page.number));
+                        if ui
+                            .add_enabled(child.is_some(), egui::Button::new("下一页"))
+                            .clicked()
+                            && let Some(next_start) = child
+                        {
+                            page.previous_starts.push(page.start);
+                            page.start = next_start;
+                            page.number += 1;
+                        }
+                    });
+                }
+                ui.data_mut(|data| data.insert_temp(page_id, page));
             });
         if current_selection == Some(node_id) {
             ui.painter().rect_stroke(
@@ -223,16 +267,28 @@ fn show_xml_tree_node(
         return;
     };
     let label = format!("<>  {}", outline.label(node_id));
-    if let Some(first_child) = outline.first_child(node_id)
-        && render_depth < 64
-    {
+    if let Some(first_child) = outline.first_child(node_id) {
         let response = egui::CollapsingHeader::new(label)
             .id_salt(("xml_node", node_id))
             .default_open(render_depth == 0)
             .show(ui, |ui| {
-                let mut child = Some(first_child);
+                let page_id = ui.make_persistent_id((
+                    "xml_sibling_page",
+                    outline.nodes.as_ptr() as usize,
+                    node_id,
+                ));
+                let mut page = ui
+                    .data_mut(|data| data.get_temp::<StructureTreePage>(page_id))
+                    .unwrap_or_else(|| StructureTreePage::new(first_child));
+                if page.start >= outline.nodes.len() {
+                    page = StructureTreePage::new(first_child);
+                }
+
+                let mut child = Some(page.start);
                 let mut shown = 0_usize;
-                while let Some(child_id) = child {
+                while let Some(child_id) = child
+                    && shown < STRUCTURE_TREE_PAGE_SIZE
+                {
                     show_xml_tree_node(
                         ui,
                         outline,
@@ -243,17 +299,34 @@ fn show_xml_tree_node(
                     );
                     child = outline.next_sibling(child_id);
                     shown += 1;
-                    if shown >= JSON_TREE_MAX_SIBLINGS {
-                        ui.label(
-                            RichText::new(format!(
-                                "该层仅显示前 {JSON_TREE_MAX_SIBLINGS} 个节点；可使用名称筛选"
-                            ))
-                            .small()
-                            .color(theme::MUTED),
-                        );
-                        break;
-                    }
                 }
+
+                if !page.previous_starts.is_empty() || child.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !page.previous_starts.is_empty(),
+                                egui::Button::new("上一页"),
+                            )
+                            .clicked()
+                            && let Some(previous_start) = page.previous_starts.pop()
+                        {
+                            page.start = previous_start;
+                            page.number = page.number.saturating_sub(1).max(1);
+                        }
+                        ui.label(format!("第 {} 页", page.number));
+                        if ui
+                            .add_enabled(child.is_some(), egui::Button::new("下一页"))
+                            .clicked()
+                            && let Some(next_start) = child
+                        {
+                            page.previous_starts.push(page.start);
+                            page.start = next_start;
+                            page.number += 1;
+                        }
+                    });
+                }
+                ui.data_mut(|data| data.insert_temp(page_id, page));
             });
         if current_selection == Some(node_id) {
             ui.painter().rect_stroke(
@@ -971,16 +1044,6 @@ impl DocumentView {
             || (self.xml_format_needed && self.formatted_xml_temp.is_none())
             || !self.document.index_status().complete
         {
-            return;
-        }
-        if self.document.len() > MAX_XML_OUTLINE_BYTES {
-            self.xml_index_started = true;
-            let message = format!(
-                "XML 大于 {}，为限制单事件内存，结构索引已禁用；可使用全文件搜索",
-                format_bytes(MAX_XML_OUTLINE_BYTES)
-            );
-            self.xml_index_error = Some(message.clone());
-            self.status_message = message;
             return;
         }
         self.xml_index_started = true;
@@ -2847,23 +2910,17 @@ impl NkgApp {
                 tab.json_filter_cache_query.clear();
                 tab.json_filter_cache_query.push_str(filter);
                 tab.json_filter_matches.clear();
-                tab.json_filter_matches.extend(
-                    outline
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(node_id, _)| {
-                            contains_ascii_case_insensitive(outline.label(node_id), filter)
-                                .then_some(node_id)
-                        })
-                        .take(JSON_FILTER_MAX_RESULTS),
-                );
+                tab.json_filter_matches
+                    .extend(outline.nodes.iter().enumerate().filter_map(|(node_id, _)| {
+                        contains_ascii_case_insensitive(outline.label(node_id), filter)
+                            .then_some(node_id)
+                    }));
             }
-            egui::ScrollArea::vertical()
-                .id_salt(("json_outline", &tab.path))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if filter.is_empty() {
+            if filter.is_empty() {
+                egui::ScrollArea::vertical()
+                    .id_salt(("json_outline", &tab.path))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                         if !outline.nodes.is_empty() {
                             show_json_tree_node(
                                 ui,
@@ -2874,36 +2931,40 @@ impl NkgApp {
                                 &mut selected,
                             );
                         }
-                    } else {
-                        for &node_id in &tab.json_filter_matches {
-                            let node = &outline.nodes[node_id];
-                            let path = outline
-                                .path(node_id)
-                                .into_iter()
-                                .map(|id| outline.label(id))
-                                .collect::<Vec<_>>()
-                                .join(" › ");
-                            if ui
-                                .selectable_label(
-                                    tab.selected_json_node == Some(node_id),
-                                    format!("{}  {path}", node.kind.icon()),
-                                )
-                                .clicked()
-                            {
-                                selected = Some(node_id);
+                    });
+            } else if tab.json_filter_matches.is_empty() {
+                ui.label("结构索引中没有匹配；按 Enter 可启动全文件 Key 搜索");
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt(("json_outline_filter", &tab.path))
+                    .auto_shrink([false, false])
+                    .show_rows(
+                        ui,
+                        SEARCH_RESULT_ROW_HEIGHT,
+                        tab.json_filter_matches.len(),
+                        |ui, visible_rows| {
+                            for match_index in visible_rows {
+                                let node_id = tab.json_filter_matches[match_index];
+                                let node = &outline.nodes[node_id];
+                                let path = outline
+                                    .path(node_id)
+                                    .into_iter()
+                                    .map(|id| outline.label(id))
+                                    .collect::<Vec<_>>()
+                                    .join(" › ");
+                                if ui
+                                    .selectable_label(
+                                        tab.selected_json_node == Some(node_id),
+                                        format!("{}  {path}", node.kind.icon()),
+                                    )
+                                    .clicked()
+                                {
+                                    selected = Some(node_id);
+                                }
                             }
-                        }
-                        if tab.json_filter_matches.len() >= JSON_FILTER_MAX_RESULTS {
-                            ui.label(
-                                RichText::new(format!("仅显示前 {JSON_FILTER_MAX_RESULTS} 个匹配"))
-                                    .small()
-                                    .color(theme::MUTED),
-                            );
-                        } else if tab.json_filter_matches.is_empty() {
-                            ui.label("结构索引中没有匹配；按 Enter 可启动全文件 Key 搜索");
-                        }
-                    }
-                });
+                        },
+                    );
+            }
 
             if (jump_requested || jump_clicked) && !tab.json_filter.trim().is_empty() {
                 let query = tab.json_filter.trim();
@@ -3020,23 +3081,17 @@ impl NkgApp {
                 tab.xml_filter_cache_query.clear();
                 tab.xml_filter_cache_query.push_str(filter);
                 tab.xml_filter_matches.clear();
-                tab.xml_filter_matches.extend(
-                    outline
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(node_id, _)| {
-                            contains_ascii_case_insensitive(outline.label(node_id), filter)
-                                .then_some(node_id)
-                        })
-                        .take(JSON_FILTER_MAX_RESULTS),
-                );
+                tab.xml_filter_matches
+                    .extend(outline.nodes.iter().enumerate().filter_map(|(node_id, _)| {
+                        contains_ascii_case_insensitive(outline.label(node_id), filter)
+                            .then_some(node_id)
+                    }));
             }
-            egui::ScrollArea::vertical()
-                .id_salt(("xml_outline", &tab.path))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if filter.is_empty() {
+            if filter.is_empty() {
+                egui::ScrollArea::vertical()
+                    .id_salt(("xml_outline", &tab.path))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                         if !outline.nodes.is_empty() {
                             show_xml_tree_node(
                                 ui,
@@ -3047,35 +3102,39 @@ impl NkgApp {
                                 &mut selected,
                             );
                         }
-                    } else {
-                        for &node_id in &tab.xml_filter_matches {
-                            let path = outline
-                                .path(node_id)
-                                .into_iter()
-                                .map(|id| outline.label(id))
-                                .collect::<Vec<_>>()
-                                .join(" › ");
-                            if ui
-                                .selectable_label(
-                                    tab.selected_xml_node == Some(node_id),
-                                    format!("<>  {path}"),
-                                )
-                                .clicked()
-                            {
-                                selected = Some(node_id);
+                    });
+            } else if tab.xml_filter_matches.is_empty() {
+                ui.label("结构索引中没有匹配；按 Enter 可启动全文件标签搜索");
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt(("xml_outline_filter", &tab.path))
+                    .auto_shrink([false, false])
+                    .show_rows(
+                        ui,
+                        SEARCH_RESULT_ROW_HEIGHT,
+                        tab.xml_filter_matches.len(),
+                        |ui, visible_rows| {
+                            for match_index in visible_rows {
+                                let node_id = tab.xml_filter_matches[match_index];
+                                let path = outline
+                                    .path(node_id)
+                                    .into_iter()
+                                    .map(|id| outline.label(id))
+                                    .collect::<Vec<_>>()
+                                    .join(" › ");
+                                if ui
+                                    .selectable_label(
+                                        tab.selected_xml_node == Some(node_id),
+                                        format!("<>  {path}"),
+                                    )
+                                    .clicked()
+                                {
+                                    selected = Some(node_id);
+                                }
                             }
-                        }
-                        if tab.xml_filter_matches.len() >= JSON_FILTER_MAX_RESULTS {
-                            ui.label(
-                                RichText::new(format!("仅显示前 {JSON_FILTER_MAX_RESULTS} 个匹配"))
-                                    .small()
-                                    .color(theme::MUTED),
-                            );
-                        } else if tab.xml_filter_matches.is_empty() {
-                            ui.label("结构索引中没有匹配；按 Enter 可启动全文件标签搜索");
-                        }
-                    }
-                });
+                        },
+                    );
+            }
 
             if (jump_requested || jump_clicked) && !tab.xml_filter.trim().is_empty() {
                 let query = tab.xml_filter.trim();

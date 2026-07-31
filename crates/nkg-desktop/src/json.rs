@@ -1,13 +1,16 @@
 use nkg_text_engine::TextDocument;
 use std::{
+    collections::TryReserveError,
     io::{BufWriter, Write},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 const JSON_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURED_KEY_BYTES: usize = 256;
-const MAX_OUTLINE_NODES: usize = 1_000_000;
-const MAX_OUTLINE_LABEL_BYTES: usize = 64 * 1024 * 1024;
+const OUTLINE_INITIAL_NODE_CAPACITY: usize = 1_024;
+const OUTLINE_NODE_GROWTH: usize = 65_536;
+const OUTLINE_INITIAL_LABEL_CAPACITY: usize = 64 * 1024;
+const OUTLINE_LABEL_GROWTH: usize = 1024 * 1024;
 const MAX_JSON_NESTING_DEPTH: usize = 4_096;
 const MAX_FORMAT_EXPANSION: u64 = 8;
 const FORMAT_OUTPUT_HEADROOM: u64 = 16 * 1024 * 1024;
@@ -305,7 +308,7 @@ pub struct JsonOutlineNode {
     pub byte_end: u64,
     pub depth: u32,
     pub kind: JsonNodeKind,
-    label_start: u32,
+    label_start: usize,
     label_len: u16,
     parent: u32,
     first_child: u32,
@@ -322,7 +325,7 @@ pub struct JsonOutline {
 impl JsonOutline {
     pub fn label(&self, node_id: usize) -> &str {
         let node = &self.nodes[node_id];
-        let start = node.label_start as usize;
+        let start = node.label_start;
         let end = start + node.label_len as usize;
         // Labels are built from Rust strings, so the shared arena is always valid UTF-8.
         std::str::from_utf8(&self.labels[start..end]).expect("JSON outline label must be UTF-8")
@@ -428,22 +431,6 @@ impl OutlineBuilder {
         kind: JsonNodeKind,
         parent: Option<usize>,
     ) -> Result<usize, String> {
-        if self.nodes.len() >= MAX_OUTLINE_NODES {
-            return Err(format!(
-                "JSON 结构节点超过 {MAX_OUTLINE_NODES} 个；已停止建立结构索引，请改用全文件搜索"
-            ));
-        }
-        if self
-            .labels
-            .len()
-            .checked_add(label.len())
-            .is_none_or(|size| size > MAX_OUTLINE_LABEL_BYTES)
-        {
-            return Err(format!(
-                "JSON 结构标签超过 {} MiB；已停止建立结构索引，请改用全文件搜索",
-                MAX_OUTLINE_LABEL_BYTES / (1024 * 1024)
-            ));
-        }
         let id = self.nodes.len();
         let compact_id =
             u32::try_from(id).map_err(|_| "JSON 节点数量超过内部索引范围".to_owned())?;
@@ -459,10 +446,10 @@ impl OutlineBuilder {
         let depth = parent
             .and_then(|parent| self.nodes.get(parent))
             .map_or(0, |node| node.depth.saturating_add(1));
-        let label_start = u32::try_from(self.labels.len())
-            .map_err(|_| "JSON Key 索引占用超过 4 GiB".to_owned())?;
+        let label_start = self.labels.len();
         let label_len =
             u16::try_from(label.len()).map_err(|_| "JSON Key 长度超过内部范围".to_owned())?;
+        self.reserve_for_node(label.len())?;
         self.labels.extend_from_slice(label.as_bytes());
         self.nodes.push(JsonOutlineNode {
             byte_start,
@@ -489,11 +476,60 @@ impl OutlineBuilder {
         Ok(id)
     }
 
+    fn reserve_for_node(&mut self, label_len: usize) -> Result<(), String> {
+        try_reserve_growth(
+            &mut self.nodes,
+            1,
+            OUTLINE_INITIAL_NODE_CAPACITY,
+            OUTLINE_NODE_GROWTH,
+        )
+        .and_then(|_| {
+            try_reserve_growth(
+                &mut self.last_children,
+                1,
+                OUTLINE_INITIAL_NODE_CAPACITY,
+                OUTLINE_NODE_GROWTH,
+            )
+        })
+        .and_then(|_| {
+            try_reserve_growth(
+                &mut self.labels,
+                label_len,
+                OUTLINE_INITIAL_LABEL_CAPACITY,
+                OUTLINE_LABEL_GROWTH,
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "系统无法为 JSON 结构索引继续分配内存（已建立 {} 个节点、{} bytes 标签）：{error}",
+                self.nodes.len(),
+                self.labels.len()
+            )
+        })
+    }
+
     fn finish(&mut self, node_id: usize, byte_end: u64) {
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.byte_end = byte_end.max(node.byte_start);
         }
     }
+}
+
+fn try_reserve_growth<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    initial_capacity: usize,
+    growth: usize,
+) -> Result<(), TryReserveError> {
+    if values.capacity().saturating_sub(values.len()) >= additional {
+        return Ok(());
+    }
+    let reserve = additional.max(if values.capacity() == 0 {
+        initial_capacity
+    } else {
+        growth
+    });
+    values.try_reserve(reserve)
 }
 
 struct JsonScanner {
@@ -915,23 +951,26 @@ mod tests {
     }
 
     #[test]
-    fn retains_nodes_beyond_the_previous_preview_limit() {
-        const ITEM_COUNT: usize = 200_100;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"[").unwrap();
+    fn retains_nodes_beyond_the_former_million_node_limit() {
+        const ITEM_COUNT: usize = 1_000_100;
+        let mut source = Vec::with_capacity(ITEM_COUNT * 2 + 1);
+        source.push(b'[');
         for index in 0..ITEM_COUNT {
             if index > 0 {
-                file.write_all(b",").unwrap();
+                source.push(b',');
             }
-            file.write_all(b"0").unwrap();
+            source.push(b'0');
         }
-        file.write_all(b"]").unwrap();
+        source.push(b']');
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&source).unwrap();
         file.flush().unwrap();
 
         let document = TextDocument::open(file.path()).unwrap();
         let outline = scan_json_outline(&document, &AtomicBool::new(false), |_, _| {}).unwrap();
 
         assert_eq!(outline.nodes.len(), ITEM_COUNT + 1);
+        assert_eq!(outline.next_sibling(ITEM_COUNT - 1), Some(ITEM_COUNT));
         assert_eq!(outline.label(ITEM_COUNT), format!("[{}]", ITEM_COUNT - 1));
     }
 
