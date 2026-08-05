@@ -1,4 +1,5 @@
 use crate::{
+    binary_template::{BinaryParseResult, MAX_TEMPLATE_SOURCE_BYTES, parse_binary_template},
     edit::{LinePatch, save_patched_copy},
     json::{JsonOutline, format_json_to_temp, scan_json_outline},
     theme,
@@ -128,6 +129,7 @@ enum SidebarMode {
     Explorer,
     Search,
     Json,
+    Binary,
     Compare,
 }
 
@@ -347,6 +349,92 @@ fn show_xml_tree_node(
     }
 }
 
+fn show_binary_tree_node(
+    ui: &mut egui::Ui,
+    result: &BinaryParseResult,
+    node_id: usize,
+    depth: usize,
+    current_selection: Option<usize>,
+    selected: &mut Option<usize>,
+) {
+    let Some(node) = result.nodes.get(node_id) else {
+        return;
+    };
+    let value = node
+        .value
+        .as_deref()
+        .map_or_else(String::new, |value| format!(" = {value}"));
+    let label = format!("{}: {}{}", node.name, node.type_name, value);
+    let hover = format!(
+        "字节 0x{:X}..0x{:X}（{} 字节）",
+        node.byte_start,
+        node.byte_start.saturating_add(node.byte_size),
+        node.byte_size
+    );
+    if node.children.is_empty() {
+        if ui
+            .selectable_label(current_selection == Some(node_id), label)
+            .on_hover_text(hover)
+            .clicked()
+        {
+            *selected = Some(node_id);
+        }
+        return;
+    }
+    let mut response = egui::CollapsingHeader::new(label)
+        .id_salt(("binary_node", node_id))
+        .default_open(depth == 0)
+        .show(ui, |ui| {
+            let page_id = ui.make_persistent_id((
+                "binary_child_page",
+                result.nodes.as_ptr() as usize,
+                node_id,
+            ));
+            let maximum_page = node.children.len().saturating_sub(1) / STRUCTURE_TREE_PAGE_SIZE;
+            let mut page = ui
+                .data_mut(|data| data.get_temp::<usize>(page_id))
+                .unwrap_or(0)
+                .min(maximum_page);
+            let start = page.saturating_mul(STRUCTURE_TREE_PAGE_SIZE);
+            let end = start
+                .saturating_add(STRUCTURE_TREE_PAGE_SIZE)
+                .min(node.children.len());
+            for child in &node.children[start..end] {
+                show_binary_tree_node(ui, result, *child, depth + 1, current_selection, selected);
+            }
+            if maximum_page > 0 {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(page > 0, egui::Button::new("上一页"))
+                        .clicked()
+                    {
+                        page = page.saturating_sub(1);
+                    }
+                    ui.label(format!("第 {} / {} 页", page + 1, maximum_page + 1));
+                    if ui
+                        .add_enabled(page < maximum_page, egui::Button::new("下一页"))
+                        .clicked()
+                    {
+                        page += 1;
+                    }
+                });
+                ui.data_mut(|data| data.insert_temp(page_id, page));
+            }
+        });
+    response.header_response = response.header_response.on_hover_text(hover);
+    if current_selection == Some(node_id) {
+        ui.painter().rect_stroke(
+            response.header_response.rect,
+            2.0,
+            egui::Stroke::new(1.0, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if response.header_response.clicked() {
+        *selected = Some(node_id);
+    }
+}
+
 enum SearchEvent {
     Progress(SearchAllProgress),
     Finished(Result<SearchAllResult, String>),
@@ -441,6 +529,15 @@ enum XmlFormatEvent {
 
 struct XmlFormatTask {
     receiver: Receiver<XmlFormatEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum BinaryTemplateEvent {
+    Finished(Result<BinaryParseResult, String>),
+}
+
+struct BinaryTemplateTask {
+    receiver: Receiver<BinaryTemplateEvent>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -550,6 +647,13 @@ fn search_session_rows(sessions: &[SearchSession]) -> (Vec<SearchSessionRows>, u
     (layouts, next_row)
 }
 
+fn search_rows_with_viewport_tail(rows: usize, viewport_height: f32) -> usize {
+    let tail_rows = (viewport_height.max(0.0) / SEARCH_RESULT_ROW_HEIGHT)
+        .ceil()
+        .max(1.0) as usize;
+    rows.saturating_add(tail_rows)
+}
+
 struct DocumentView {
     path: PathBuf,
     document: Arc<TextDocument>,
@@ -620,6 +724,11 @@ struct DocumentView {
     xml_format_progress: Option<(u64, u64)>,
     xml_format_error: Option<String>,
     formatted_xml_temp: Option<tempfile::NamedTempFile>,
+    binary_template_path: Option<PathBuf>,
+    binary_template_task: Option<BinaryTemplateTask>,
+    binary_template_result: Option<BinaryParseResult>,
+    binary_template_error: Option<String>,
+    selected_binary_node: Option<usize>,
     original_file_len: u64,
 }
 
@@ -646,7 +755,7 @@ impl DocumentView {
             window,
             requested_offset: 0,
             query: String::new(),
-            ignore_ascii_case: false,
+            ignore_ascii_case: true,
             highlights: Vec::new(),
             search_task: None,
             search_sessions: Vec::new(),
@@ -716,6 +825,11 @@ impl DocumentView {
             xml_format_progress: None,
             xml_format_error: None,
             formatted_xml_temp: None,
+            binary_template_path: None,
+            binary_template_task: None,
+            binary_template_result: None,
+            binary_template_error: None,
+            selected_binary_node: None,
             original_file_len,
         })
     }
@@ -738,6 +852,7 @@ impl DocumentView {
             || self.json_index_task.is_some()
             || self.xml_format_task.is_some()
             || self.xml_index_task.is_some()
+            || self.binary_template_task.is_some()
             || self.document.index_status().running
     }
 
@@ -778,6 +893,13 @@ impl DocumentView {
         self.edit_buffer.clear();
         self.edits.clear();
         self.highlights.clear();
+        if let Some(task) = &self.binary_template_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        self.binary_template_task = None;
+        self.binary_template_result = None;
+        self.binary_template_error = None;
+        self.selected_binary_node = None;
         if is_json {
             self.json_index_started = false;
             self.json_outline = None;
@@ -1063,6 +1185,52 @@ impl DocumentView {
         self.xml_index_task = Some(XmlIndexTask { receiver, cancel });
         self.xml_index_progress = Some((0, total));
         self.status_message = "正在后台建立 XML 结构索引…".into();
+    }
+
+    fn start_binary_template(&mut self, path: PathBuf, context: &egui::Context) {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.binary_template_error = Some(format!("无法读取模板信息：{error}"));
+                return;
+            }
+        };
+        if metadata.len() > MAX_TEMPLATE_SOURCE_BYTES as u64 {
+            self.binary_template_error = Some(format!(
+                "模板文件不能超过 {}",
+                format_bytes(MAX_TEMPLATE_SOURCE_BYTES as u64)
+            ));
+            return;
+        }
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.binary_template_error = Some(format!("模板必须是 UTF-8 文本：{error}"));
+                return;
+            }
+        };
+        if let Some(task) = &self.binary_template_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        let document = Arc::clone(&self.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        std::thread::Builder::new()
+            .name("nkg-binary-template".into())
+            .spawn(move || {
+                let result = parse_binary_template(&document, &source, &worker_cancel);
+                let _ = sender.send(BinaryTemplateEvent::Finished(result));
+                repaint_context.request_repaint();
+            })
+            .expect("failed to spawn binary template thread");
+        self.binary_template_path = Some(path);
+        self.binary_template_task = Some(BinaryTemplateTask { receiver, cancel });
+        self.binary_template_result = None;
+        self.binary_template_error = None;
+        self.selected_binary_node = None;
+        self.status_message = "正在解析二进制模板…".into();
     }
 
     fn page_down(&mut self) {
@@ -1709,6 +1877,39 @@ impl DocumentView {
             self.xml_index_task = None;
         }
 
+        let binary_events = self
+            .binary_template_task
+            .as_ref()
+            .map(|task| task.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut binary_finished = false;
+        for event in binary_events {
+            match event {
+                BinaryTemplateEvent::Finished(result) => {
+                    binary_finished = true;
+                    match result {
+                        Ok(result) => {
+                            self.status_message = format!(
+                                "二进制模板解析完成：{} 个节点，覆盖 {}",
+                                result.nodes.len(),
+                                format_bytes(result.consumed_bytes)
+                            );
+                            self.binary_template_result = Some(result);
+                            self.binary_template_error = None;
+                        }
+                        Err(error) => {
+                            self.status_message = format!("二进制模板解析失败：{error}");
+                            self.binary_template_error = Some(error);
+                            self.binary_template_result = None;
+                        }
+                    }
+                }
+            }
+        }
+        if binary_finished {
+            self.binary_template_task = None;
+        }
+
         let index_status = self.document.index_status();
         if index_status.complete && !self.index_was_complete {
             self.index_was_complete = true;
@@ -1768,6 +1969,23 @@ impl DocumentView {
         self.status_message = format!("已跳转 XML 节点：<{label}>");
     }
 
+    fn jump_to_binary_node(&mut self, node_id: usize, offset: u64, label: &str) {
+        self.selected_editor_line = None;
+        self.editor_select_all = false;
+        self.load_centered_offset(offset);
+        if let Some(line_start) = self
+            .window
+            .lines
+            .iter()
+            .find(|line| line.byte_start <= offset && offset < line.byte_end)
+            .map(|line| line.byte_start)
+        {
+            self.select_editor_line(line_start);
+        }
+        self.selected_binary_node = Some(node_id);
+        self.status_message = format!("已跳转二进制字段：{label}");
+    }
+
     fn remove_search_session(&mut self, session_id: u64) {
         if self
             .search_task
@@ -1808,6 +2026,9 @@ impl Drop for DocumentView {
             task.cancel.store(true, Ordering::Release);
         }
         if let Some(task) = &self.xml_format_task {
+            task.cancel.store(true, Ordering::Release);
+        }
+        if let Some(task) = &self.binary_template_task {
             task.cancel.store(true, Ordering::Release);
         }
         if Arc::strong_count(&self.document) == 1 {
@@ -2316,6 +2537,21 @@ impl NkgApp {
         }
     }
 
+    fn binary_template_dialog(&mut self, context: &egui::Context) {
+        if self.active().is_none() {
+            self.global_message = "请先打开要解析的二进制文件".into();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("导入 C/C++ 风格二进制模板")
+            .add_filter("二进制模板", &["bt", "hexpat", "h", "hpp", "txt"])
+            .pick_file()
+            && let Some(tab) = self.active_mut()
+        {
+            tab.start_binary_template(path, context);
+        }
+    }
+
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -2632,6 +2868,18 @@ impl NkgApp {
                     }
                     if activity_button(
                         ui,
+                        "模",
+                        "二进制模板",
+                        self.sidebar_visible && self.sidebar_mode == SidebarMode::Binary,
+                    ) {
+                        toggle_sidebar_mode(
+                            &mut self.sidebar_visible,
+                            &mut self.sidebar_mode,
+                            SidebarMode::Binary,
+                        );
+                    }
+                    if activity_button(
+                        ui,
                         "搜",
                         "搜索",
                         self.sidebar_visible && self.sidebar_mode == SidebarMode::Search,
@@ -2682,6 +2930,10 @@ impl NkgApp {
                     } else {
                         self.show_json_outline(ui);
                     }
+                }
+                SidebarMode::Binary => {
+                    let context = ui.ctx().clone();
+                    self.show_binary_template(ui, &context);
                 }
                 SidebarMode::Compare => {
                     let context = ui.ctx().clone();
@@ -2828,6 +3080,92 @@ impl NkgApp {
             if !tab.search_results_open && ui.button("打开查找结果").clicked() {
                 tab.search_results_open = true;
             }
+        }
+    }
+
+    fn show_binary_template(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        section_title(ui, "二进制模板");
+        if self.active().is_none() {
+            ui.label("请先打开要解析的二进制文件");
+            return;
+        }
+        if ui.button("＋ 导入模板").clicked() {
+            self.binary_template_dialog(context);
+        }
+
+        let reparse_path = self
+            .active()
+            .and_then(|tab| tab.binary_template_path.clone());
+        if let Some(path) = &reparse_path {
+            ui.label(
+                RichText::new(path.display().to_string())
+                    .small()
+                    .color(theme::MUTED),
+            );
+            if ui.button("重新解析").clicked()
+                && let Some(tab) = self.active_mut()
+            {
+                tab.start_binary_template(path.clone(), context);
+            }
+        }
+
+        let Some(tab) = self.active_mut() else {
+            return;
+        };
+        if tab.binary_template_task.is_some() {
+            ui.add(egui::Spinner::new());
+            ui.label("正在后台解析模板和二进制数据…");
+        }
+        if let Some(error) = &tab.binary_template_error {
+            ui.colored_label(theme::ERROR, error);
+        }
+        let Some(result) = &tab.binary_template_result else {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "兼容 C/C++ 风格顺序布局：struct、typedef、enum、定长/计数字段数组、基础整数与浮点类型，以及大小端指令。",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+            ui.label(
+                RichText::new("结构按二进制模板语义紧凑排列，不应用 C++ ABI 对齐；暂不支持指针、位字段、函数和任意表达式。")
+                    .small()
+                    .color(theme::MUTED),
+            );
+            return;
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} 个节点", result.nodes.len()));
+            ui.separator();
+            ui.label(result.endianness.label());
+            ui.separator();
+            ui.label(format!("覆盖 {}", format_bytes(result.consumed_bytes)));
+        });
+        ui.add_space(4.0);
+        let mut selected = None;
+        egui::ScrollArea::both()
+            .id_salt(("binary_template_tree", &tab.path))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for root in &result.roots {
+                    show_binary_tree_node(
+                        ui,
+                        result,
+                        *root,
+                        0,
+                        tab.selected_binary_node,
+                        &mut selected,
+                    );
+                }
+            });
+        if let Some(node_id) = selected
+            && let Some(node) = result.nodes.get(node_id)
+        {
+            let offset = node.byte_start;
+            let label = node.name.clone();
+            tab.jump_to_binary_node(node_id, offset, &label);
         }
     }
 
@@ -3543,6 +3881,7 @@ impl NkgApp {
                         ((pointer.y - grab_offset - track.top()) / travel).clamp(0.0, 1.0) as f64
                     };
                     tab.overview_drag_ratio = Some(ratio);
+                    tab.load_overview_position(ratio);
                 } else if response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
                 {
@@ -4665,6 +5004,7 @@ fn show_search_results(
 
     let (layouts, total_rows_u64) = search_session_rows(&tab.search_sessions);
     let total_rows = usize::try_from(total_rows_u64).unwrap_or(usize::MAX);
+    let rendered_rows = search_rows_with_viewport_tail(total_rows, ui.available_height());
     let active_session_id = tab.search_task.as_ref().map(|task| task.session_id);
     let document = Arc::clone(&tab.document);
     let search_viewport_width = ui.available_width();
@@ -4684,82 +5024,87 @@ fn show_search_results(
     let mut select_result_row = None;
     let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
-    scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
-        let visible_start = visible.start as u64;
-        let visible_end = visible.end as u64;
-        for layout in &layouts {
-            if layout.end_row <= visible_start || layout.header_row >= visible_end {
-                continue;
-            }
-            let session = &mut tab.search_sessions[layout.session_index];
-            if visible_start <= layout.header_row && layout.header_row < visible_end {
-                let is_compare_left = compare_left.is_some_and(|source| {
-                    source.key.path == tab.path && source.key.session_id == session.id
-                });
-                let action = show_search_session_header(
-                    ui,
-                    session,
-                    active_session_id == Some(session.id),
-                    is_compare_left,
-                );
-                if action.toggle {
-                    toggle_session = Some(session.id);
-                }
-                if action.remove {
-                    remove_session = Some(session.id);
-                }
-                if action.compare {
-                    compare_session = Some(session.id);
-                }
-            }
-            if !session.expanded {
-                continue;
-            }
-
-            let first_visible_hit_row = visible_start.max(layout.hits_start);
-            let end_visible_hit_row = visible_end.min(layout.end_row);
-            if first_visible_hit_row >= end_visible_hit_row {
-                continue;
-            }
-            let first_hit = first_visible_hit_row.saturating_sub(layout.hits_start);
-            let hit_count = (end_visible_hit_row - first_visible_hit_row) as usize;
-            let hits = match session.store.read_page(first_hit, hit_count) {
-                Ok(hits) => hits,
-                Err(error) => {
-                    read_error = Some(error.to_string());
+    scroll_area.show_rows(
+        ui,
+        SEARCH_RESULT_ROW_HEIGHT,
+        rendered_rows,
+        |ui, visible| {
+            let visible_start = visible.start as u64;
+            let visible_end = visible.end as u64;
+            for layout in &layouts {
+                if layout.end_row <= visible_start || layout.header_row >= visible_end {
                     continue;
                 }
-            };
-            let mut preview_cache = session
-                .preview_cache
-                .lock()
-                .expect("search preview cache poisoned");
-            cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
-            for (relative, hit) in hits.into_iter().enumerate() {
-                let hit_index = first_hit + relative as u64;
-                let preview = preview_cache
-                    .get(&hit_index)
-                    .expect("visible search preview was cached");
-                let is_selected =
-                    search_select_all || selected_search_hit == Some((session.id, hit_index));
-                let action = show_search_result_row(
-                    ui,
-                    session.id,
-                    hit_index,
-                    preview,
-                    is_selected,
-                    search_viewport_width,
-                );
-                if action.activate {
-                    selected_hit = Some((session.query.clone(), hit));
+                let session = &mut tab.search_sessions[layout.session_index];
+                if visible_start <= layout.header_row && layout.header_row < visible_end {
+                    let is_compare_left = compare_left.is_some_and(|source| {
+                        source.key.path == tab.path && source.key.session_id == session.id
+                    });
+                    let action = show_search_session_header(
+                        ui,
+                        session,
+                        active_session_id == Some(session.id),
+                        is_compare_left,
+                    );
+                    if action.toggle {
+                        toggle_session = Some(session.id);
+                    }
+                    if action.remove {
+                        remove_session = Some(session.id);
+                    }
+                    if action.compare {
+                        compare_session = Some(session.id);
+                    }
                 }
-                if action.select_line {
-                    select_result_row = Some((session.id, hit_index));
+                if !session.expanded {
+                    continue;
                 }
-                began_text_selection |= action.begin_text_selection;
+
+                let first_visible_hit_row = visible_start.max(layout.hits_start);
+                let end_visible_hit_row = visible_end.min(layout.end_row);
+                if first_visible_hit_row >= end_visible_hit_row {
+                    continue;
+                }
+                let first_hit = first_visible_hit_row.saturating_sub(layout.hits_start);
+                let hit_count = (end_visible_hit_row - first_visible_hit_row) as usize;
+                let hits = match session.store.read_page(first_hit, hit_count) {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        continue;
+                    }
+                };
+                let mut preview_cache = session
+                    .preview_cache
+                    .lock()
+                    .expect("search preview cache poisoned");
+                cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
+                for (relative, hit) in hits.into_iter().enumerate() {
+                    let hit_index = first_hit + relative as u64;
+                    let preview = preview_cache
+                        .get(&hit_index)
+                        .expect("visible search preview was cached");
+                    let is_selected =
+                        search_select_all || selected_search_hit == Some((session.id, hit_index));
+                    let action = show_search_result_row(
+                        ui,
+                        session.id,
+                        hit_index,
+                        preview,
+                        is_selected,
+                        search_viewport_width,
+                    );
+                    if action.activate {
+                        selected_hit = Some((session.query.clone(), hit));
+                    }
+                    if action.select_line {
+                        select_result_row = Some((session.id, hit_index));
+                    }
+                    began_text_selection |= action.begin_text_selection;
+                }
             }
-        }
-    });
+        },
+    );
 
     if let Some(session_id) = toggle_session
         && let Some(session) = tab
@@ -6717,6 +7062,12 @@ mod tests {
         assert_eq!(search_session_rows(&sessions).1, 4);
         sessions[0].expanded = false;
         assert_eq!(search_session_rows(&sessions).1, 1);
+    }
+
+    #[test]
+    fn search_results_reserve_a_viewport_tail_for_latest_header_alignment() {
+        assert_eq!(search_rows_with_viewport_tail(12, 220.0), 22);
+        assert_eq!(search_rows_with_viewport_tail(12, 1.0), 13);
     }
 
     #[test]
