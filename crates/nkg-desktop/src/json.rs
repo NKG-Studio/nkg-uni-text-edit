@@ -311,6 +311,7 @@ pub struct JsonOutlineNode {
     parent: u32,
     first_child: u32,
     next_sibling: u32,
+    child_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +328,10 @@ impl JsonOutline {
         let end = start + node.label_len as usize;
         // Labels are built from Rust strings, so the shared arena is always valid UTF-8.
         std::str::from_utf8(&self.labels[start..end]).expect("JSON outline label must be UTF-8")
+    }
+
+    pub fn child_count(&self, node_id: usize) -> u32 {
+        self.nodes[node_id].child_count
     }
 
     pub fn parent(&self, node_id: usize) -> Option<usize> {
@@ -459,6 +464,7 @@ impl OutlineBuilder {
             parent: compact_parent,
             first_child: NO_NODE,
             next_sibling: NO_NODE,
+            child_count: 0,
         });
         self.last_children.push(NO_NODE);
 
@@ -469,6 +475,7 @@ impl OutlineBuilder {
             if let Some(previous) = node_link(self.last_children[parent]) {
                 self.nodes[previous].next_sibling = compact_id;
             }
+            self.nodes[parent].child_count = self.nodes[parent].child_count.saturating_add(1);
             self.last_children[parent] = compact_id;
         }
         Ok(id)
@@ -907,6 +914,12 @@ mod tests {
         assert_eq!(outline.nodes[1].kind, JsonNodeKind::Array);
         assert_eq!(outline.nodes[5].kind, JsonNodeKind::String);
         assert_eq!(outline.nodes[6].kind, JsonNodeKind::Boolean);
+        assert_eq!(outline.child_count(0), 1);
+        assert_eq!(outline.child_count(1), 1);
+        assert_eq!(outline.child_count(2), 2);
+        assert_eq!(outline.child_count(3), 1);
+        assert_eq!(outline.child_count(4), 1);
+        assert_eq!(outline.child_count(5), 0);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{
     binary_template::{BinaryParseResult, MAX_TEMPLATE_SOURCE_BYTES, parse_binary_template},
     edit::{LinePatch, save_patched_copy},
-    json::{JsonOutline, format_json_to_temp, scan_json_outline},
+    json::{JsonNodeKind, JsonOutline, format_json_to_temp, scan_json_outline},
     theme,
     xml::{XmlOutline, canonicalize_xml_to_temp, format_xml_to_temp, scan_xml_outline},
 };
@@ -38,7 +38,6 @@ const SEARCH_PREVIEW_CACHE_LIMIT: usize = 512;
 const SEARCH_PREVIEW_BYTES: usize = 16 * 1024;
 const SEARCH_PREVIEW_LINE_SCAN_BYTES: usize = 256 * 1024;
 const MAX_SEARCH_SESSIONS: usize = 8;
-const MAX_SEARCH_RESULT_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const TITLE_BAR_CONTROL_HEIGHT: f32 = 26.0;
 const TAB_BAR_HEIGHT: f32 = 36.0;
 const TAB_HORIZONTAL_PADDING: f32 = 10.0;
@@ -174,7 +173,16 @@ fn show_json_tree_node(
     let Some(node) = outline.nodes.get(node_id) else {
         return;
     };
-    let label = format!("{}  {}", node.kind.icon(), outline.label(node_id));
+    let label = if matches!(node.kind, JsonNodeKind::Object | JsonNodeKind::Array) {
+        format!(
+            "{}  {}  ({} 项)",
+            node.kind.icon(),
+            outline.label(node_id),
+            outline.child_count(node_id)
+        )
+    } else {
+        format!("{}  {}", node.kind.icon(), outline.label(node_id))
+    };
     if let Some(first_child) = outline.first_child(node_id) {
         let response = egui::CollapsingHeader::new(label)
             .id_salt(("json_node", node_id))
@@ -444,7 +452,6 @@ struct SearchTask {
     session_id: u64,
     receiver: Receiver<SearchEvent>,
     cancel: Arc<AtomicBool>,
-    quota_reached: Arc<AtomicBool>,
 }
 
 enum BlockDiffEvent {
@@ -645,13 +652,6 @@ fn search_session_rows(sessions: &[SearchSession]) -> (Vec<SearchSessionRows>, u
         next_row = end_row;
     }
     (layouts, next_row)
-}
-
-fn search_rows_with_viewport_tail(rows: usize, viewport_height: f32) -> usize {
-    let tail_rows = (viewport_height.max(0.0) / SEARCH_RESULT_ROW_HEIGHT)
-        .ceil()
-        .max(1.0) as usize;
-    rows.saturating_add(tail_rows)
 }
 
 struct DocumentView {
@@ -1515,8 +1515,6 @@ impl DocumentView {
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let quota_reached = Arc::new(AtomicBool::new(false));
-        let worker_quota_reached = Arc::clone(&quota_reached);
         let document = Arc::clone(&self.document);
         let result_store = Arc::clone(&store);
         let result_query = self.query.clone();
@@ -1544,10 +1542,6 @@ impl DocumentView {
                         &result_store,
                         &worker_cancel,
                         |progress| {
-                            if result_store.disk_bytes() >= MAX_SEARCH_RESULT_DISK_BYTES {
-                                worker_quota_reached.store(true, Ordering::Release);
-                                worker_cancel.store(true, Ordering::Release);
-                            }
                             if progress.scanned_bytes >= next_progress_report
                                 || progress.scanned_bytes == progress.total_bytes
                             {
@@ -1568,7 +1562,6 @@ impl DocumentView {
             session_id,
             receiver,
             cancel,
-            quota_reached,
         });
         if self.search_sessions.len() >= MAX_SEARCH_SESSIONS {
             self.search_sessions.remove(0);
@@ -1605,7 +1598,6 @@ impl DocumentView {
         let mut finished = false;
         if let Some(task) = &self.search_task {
             let session_id = task.session_id;
-            let quota_reached = task.quota_reached.load(Ordering::Acquire);
             let events = task.receiver.try_iter().collect::<Vec<_>>();
             for event in events {
                 if let Some(session) = self
@@ -1624,13 +1616,7 @@ impl DocumentView {
                                         total_bytes: result.search_bytes,
                                         hit_count: result.hit_count,
                                     };
-                                    self.status_message = if quota_reached {
-                                        format!(
-                                            "搜索结果达到 {} 临时盘上限：已保留 {} 个结果",
-                                            format_bytes(MAX_SEARCH_RESULT_DISK_BYTES),
-                                            result.hit_count
-                                        )
-                                    } else if result.cancelled {
+                                    self.status_message = if result.cancelled {
                                         format!("搜索已取消：已收集 {} 个结果", result.hit_count)
                                     } else {
                                         format!("搜索完成：{} 个结果", result.hit_count)
@@ -5004,7 +4990,6 @@ fn show_search_results(
 
     let (layouts, total_rows_u64) = search_session_rows(&tab.search_sessions);
     let total_rows = usize::try_from(total_rows_u64).unwrap_or(usize::MAX);
-    let rendered_rows = search_rows_with_viewport_tail(total_rows, ui.available_height());
     let active_session_id = tab.search_task.as_ref().map(|task| task.session_id);
     let document = Arc::clone(&tab.document);
     let search_viewport_width = ui.available_width();
@@ -5024,87 +5009,82 @@ fn show_search_results(
     let mut select_result_row = None;
     let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
-    scroll_area.show_rows(
-        ui,
-        SEARCH_RESULT_ROW_HEIGHT,
-        rendered_rows,
-        |ui, visible| {
-            let visible_start = visible.start as u64;
-            let visible_end = visible.end as u64;
-            for layout in &layouts {
-                if layout.end_row <= visible_start || layout.header_row >= visible_end {
-                    continue;
+    scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
+        let visible_start = visible.start as u64;
+        let visible_end = visible.end as u64;
+        for layout in &layouts {
+            if layout.end_row <= visible_start || layout.header_row >= visible_end {
+                continue;
+            }
+            let session = &mut tab.search_sessions[layout.session_index];
+            if visible_start <= layout.header_row && layout.header_row < visible_end {
+                let is_compare_left = compare_left.is_some_and(|source| {
+                    source.key.path == tab.path && source.key.session_id == session.id
+                });
+                let action = show_search_session_header(
+                    ui,
+                    session,
+                    active_session_id == Some(session.id),
+                    is_compare_left,
+                );
+                if action.toggle {
+                    toggle_session = Some(session.id);
                 }
-                let session = &mut tab.search_sessions[layout.session_index];
-                if visible_start <= layout.header_row && layout.header_row < visible_end {
-                    let is_compare_left = compare_left.is_some_and(|source| {
-                        source.key.path == tab.path && source.key.session_id == session.id
-                    });
-                    let action = show_search_session_header(
-                        ui,
-                        session,
-                        active_session_id == Some(session.id),
-                        is_compare_left,
-                    );
-                    if action.toggle {
-                        toggle_session = Some(session.id);
-                    }
-                    if action.remove {
-                        remove_session = Some(session.id);
-                    }
-                    if action.compare {
-                        compare_session = Some(session.id);
-                    }
+                if action.remove {
+                    remove_session = Some(session.id);
                 }
-                if !session.expanded {
-                    continue;
-                }
-
-                let first_visible_hit_row = visible_start.max(layout.hits_start);
-                let end_visible_hit_row = visible_end.min(layout.end_row);
-                if first_visible_hit_row >= end_visible_hit_row {
-                    continue;
-                }
-                let first_hit = first_visible_hit_row.saturating_sub(layout.hits_start);
-                let hit_count = (end_visible_hit_row - first_visible_hit_row) as usize;
-                let hits = match session.store.read_page(first_hit, hit_count) {
-                    Ok(hits) => hits,
-                    Err(error) => {
-                        read_error = Some(error.to_string());
-                        continue;
-                    }
-                };
-                let mut preview_cache = session
-                    .preview_cache
-                    .lock()
-                    .expect("search preview cache poisoned");
-                cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
-                for (relative, hit) in hits.into_iter().enumerate() {
-                    let hit_index = first_hit + relative as u64;
-                    let preview = preview_cache
-                        .get(&hit_index)
-                        .expect("visible search preview was cached");
-                    let is_selected =
-                        search_select_all || selected_search_hit == Some((session.id, hit_index));
-                    let action = show_search_result_row(
-                        ui,
-                        session.id,
-                        hit_index,
-                        preview,
-                        is_selected,
-                        search_viewport_width,
-                    );
-                    if action.activate {
-                        selected_hit = Some((session.query.clone(), hit));
-                    }
-                    if action.select_line {
-                        select_result_row = Some((session.id, hit_index));
-                    }
-                    began_text_selection |= action.begin_text_selection;
+                if action.compare {
+                    compare_session = Some(session.id);
                 }
             }
-        },
-    );
+            if !session.expanded {
+                continue;
+            }
+
+            let first_visible_hit_row = visible_start.max(layout.hits_start);
+            let end_visible_hit_row = visible_end.min(layout.end_row);
+            if first_visible_hit_row >= end_visible_hit_row {
+                continue;
+            }
+            let first_hit = first_visible_hit_row.saturating_sub(layout.hits_start);
+            let hit_count = (end_visible_hit_row - first_visible_hit_row) as usize;
+            let hits = match session.store.read_page(first_hit, hit_count) {
+                Ok(hits) => hits,
+                Err(error) => {
+                    read_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let mut preview_cache = session
+                .preview_cache
+                .lock()
+                .expect("search preview cache poisoned");
+            cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
+            for (relative, hit) in hits.into_iter().enumerate() {
+                let hit_index = first_hit + relative as u64;
+                let preview = preview_cache
+                    .get(&hit_index)
+                    .expect("visible search preview was cached");
+                let is_selected =
+                    search_select_all || selected_search_hit == Some((session.id, hit_index));
+                let action = show_search_result_row(
+                    ui,
+                    session.id,
+                    hit_index,
+                    preview,
+                    is_selected,
+                    search_viewport_width,
+                );
+                if action.activate {
+                    selected_hit = Some((session.query.clone(), hit));
+                }
+                if action.select_line {
+                    select_result_row = Some((session.id, hit_index));
+                }
+                began_text_selection |= action.begin_text_selection;
+            }
+        }
+    });
 
     if let Some(session_id) = toggle_session
         && let Some(session) = tab
@@ -7062,12 +7042,6 @@ mod tests {
         assert_eq!(search_session_rows(&sessions).1, 4);
         sessions[0].expanded = false;
         assert_eq!(search_session_rows(&sessions).1, 1);
-    }
-
-    #[test]
-    fn search_results_reserve_a_viewport_tail_for_latest_header_alignment() {
-        assert_eq!(search_rows_with_viewport_tail(12, 220.0), 22);
-        assert_eq!(search_rows_with_viewport_tail(12, 1.0), 13);
     }
 
     #[test]
