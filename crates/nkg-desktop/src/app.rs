@@ -7,8 +7,7 @@ use crate::{
 };
 use eframe::egui::{
     self, Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextFormat, TextStyle,
-    containers::scroll_area::{ScrollBarVisibility, State as ScrollAreaState},
-    text::LayoutJob,
+    containers::scroll_area::ScrollBarVisibility, text::LayoutJob,
     text_selection::LabelSelectionState,
 };
 use nkg_text_engine::{
@@ -47,6 +46,8 @@ const TAB_LABEL_HEIGHT: f32 = 24.0;
 const TAB_CLOSE_SIZE: f32 = 20.0;
 const TAB_CONTENT_GAP: f32 = 6.0;
 const SEARCH_RESULT_ROW_HEIGHT: f32 = 36.0;
+const SEARCH_RESULT_SCROLLBAR_WIDTH: f32 = 14.0;
+const SEARCH_RESULT_MIN_THUMB_HEIGHT: f32 = 18.0;
 const SEARCH_COMPARISON_ROW_HEIGHT: f32 = 42.0;
 const SEARCH_COMPARISON_HEADER_HEIGHT: f32 = 48.0;
 const SEARCH_COMPARISON_DIVIDER_WIDTH: f32 = 1.0;
@@ -655,24 +656,23 @@ fn search_session_rows(sessions: &[SearchSession]) -> (Vec<SearchSessionRows>, u
     (layouts, next_row)
 }
 
-fn search_results_max_scroll_offset(
-    total_rows: usize,
-    row_height: f32,
-    viewport_height: f32,
-) -> f32 {
-    (total_rows as f32 * row_height - viewport_height.max(0.0)).max(0.0)
+fn search_result_visible_row_capacity(viewport_height: f32) -> usize {
+    (viewport_height.max(0.0) / SEARCH_RESULT_ROW_HEIGHT)
+        .ceil()
+        .max(1.0) as usize
 }
 
-fn clamp_search_scroll_offset(
-    offset: f32,
-    total_rows: usize,
-    row_height: f32,
-    viewport_height: f32,
-) -> f32 {
-    offset.clamp(
-        0.0,
-        search_results_max_scroll_offset(total_rows, row_height, viewport_height),
-    )
+fn search_result_max_top_row(total_rows: usize, visible_rows: usize) -> usize {
+    total_rows.saturating_sub(visible_rows.max(1))
+}
+
+fn search_result_thumb_height(track_height: f32, visible_rows: usize, total_rows: usize) -> f32 {
+    let track_height = track_height.max(0.0);
+    let minimum = SEARCH_RESULT_MIN_THUMB_HEIGHT.min(track_height);
+    if total_rows <= visible_rows || total_rows == 0 {
+        return track_height;
+    }
+    (track_height * visible_rows as f32 / total_rows as f32).clamp(minimum, track_height)
 }
 
 struct DocumentView {
@@ -687,7 +687,8 @@ struct DocumentView {
     search_sessions: Vec<SearchSession>,
     next_search_session_id: u64,
     search_results_open: bool,
-    search_scroll_offset: Option<f32>,
+    search_top_row: u64,
+    search_scroll_drag_offset: Option<f32>,
     status_message: String,
     index_was_complete: bool,
     visible_row: Option<usize>,
@@ -782,7 +783,8 @@ impl DocumentView {
             search_sessions: Vec::new(),
             next_search_session_id: 1,
             search_results_open: false,
-            search_scroll_offset: None,
+            search_top_row: 0,
+            search_scroll_drag_offset: None,
             status_message: if json_format_needed {
                 "检测到单行 JSON，准备后台格式化视图…".into()
             } else if xml_format_needed {
@@ -1602,10 +1604,10 @@ impl DocumentView {
             preview_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         self.search_results_open = true;
-        self.search_scroll_offset = search_session_rows(&self.search_sessions)
+        self.search_top_row = search_session_rows(&self.search_sessions)
             .0
             .last()
-            .map(|layout| layout.header_row as f32 * SEARCH_RESULT_ROW_HEIGHT);
+            .map_or(0, |layout| layout.header_row);
         self.status_message = "正在搜索…".into();
     }
 
@@ -5015,39 +5017,93 @@ fn show_search_results(
     let document = Arc::clone(&tab.document);
     let search_select_all = tab.search_select_all;
     let selected_search_hit = tab.selected_search_hit;
-    let viewport_height = ui.available_height();
-    let scroll_id = ui.make_persistent_id(("search_sessions", &tab.path));
-    let requested_scroll_offset = tab.search_scroll_offset.take().map(|offset| {
-        clamp_search_scroll_offset(
-            offset,
-            total_rows,
-            SEARCH_RESULT_ROW_HEIGHT,
-            viewport_height,
-        )
-    });
-    if requested_scroll_offset.is_none()
-        && let Some(mut state) = ScrollAreaState::load(ui.ctx(), scroll_id)
-    {
-        let clamped = clamp_search_scroll_offset(
-            state.offset.y,
-            total_rows,
-            SEARCH_RESULT_ROW_HEIGHT,
-            viewport_height,
-        );
-        if clamped != state.offset.y {
-            state.offset.y = clamped;
-            state.store(ui.ctx(), scroll_id);
-            ui.ctx().request_repaint();
+    let viewport_size = egui::vec2(
+        ui.available_width().max(1.0),
+        ui.available_height().max(1.0),
+    );
+    let (viewport_rect, viewport_response) = ui.allocate_exact_size(viewport_size, Sense::hover());
+    let scrollbar_width = SEARCH_RESULT_SCROLLBAR_WIDTH.min(viewport_rect.width());
+    let content_rect = egui::Rect::from_min_max(
+        viewport_rect.left_top(),
+        egui::pos2(
+            viewport_rect.right() - scrollbar_width,
+            viewport_rect.bottom(),
+        ),
+    );
+    let scrollbar_rect = egui::Rect::from_min_max(
+        egui::pos2(content_rect.right(), viewport_rect.top()),
+        viewport_rect.right_bottom(),
+    );
+    let visible_row_capacity = search_result_visible_row_capacity(content_rect.height());
+    let max_top_row = search_result_max_top_row(total_rows, visible_row_capacity);
+    let mut top_row = usize::try_from(tab.search_top_row)
+        .unwrap_or(usize::MAX)
+        .min(max_top_row);
+
+    if viewport_response.hovered() {
+        let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
+        if scroll_delta.abs() > f32::EPSILON {
+            let rows = (scroll_delta.abs() / SEARCH_RESULT_ROW_HEIGHT)
+                .ceil()
+                .max(1.0) as usize;
+            top_row = if scroll_delta > 0.0 {
+                top_row.saturating_sub(rows)
+            } else {
+                top_row.saturating_add(rows).min(max_top_row)
+            };
+            ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
         }
     }
-    let mut scroll_area = ScrollArea::vertical()
-        .id_salt(("search_sessions", &tab.path))
-        .auto_shrink([false, false])
-        .content_margin(0.0)
-        .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible);
-    if let Some(offset) = requested_scroll_offset {
-        scroll_area = scroll_area.vertical_scroll_offset(offset);
+
+    let thumb_height =
+        search_result_thumb_height(scrollbar_rect.height(), visible_row_capacity, total_rows);
+    let thumb_travel = (scrollbar_rect.height() - thumb_height).max(0.0);
+    let initial_ratio = if max_top_row == 0 {
+        0.0
+    } else {
+        top_row as f32 / max_top_row as f32
+    };
+    let initial_thumb = egui::Rect::from_min_size(
+        egui::pos2(
+            scrollbar_rect.left() + 2.0,
+            scrollbar_rect.top() + thumb_travel * initial_ratio,
+        ),
+        egui::vec2((scrollbar_rect.width() - 4.0).max(1.0), thumb_height),
+    );
+    let scrollbar_response = ui.interact(
+        scrollbar_rect,
+        ui.make_persistent_id(("search_results_scrollbar", &tab.path)),
+        Sense::click_and_drag(),
+    );
+    if scrollbar_response.drag_started()
+        && let Some(pointer) = scrollbar_response.interact_pointer_pos()
+    {
+        tab.search_scroll_drag_offset = Some(if initial_thumb.contains(pointer) {
+            pointer.y - initial_thumb.top()
+        } else {
+            thumb_height * 0.5
+        });
     }
+    if (scrollbar_response.dragged() || scrollbar_response.clicked())
+        && let Some(pointer) = scrollbar_response.interact_pointer_pos()
+    {
+        let grab_offset = if scrollbar_response.dragged() {
+            tab.search_scroll_drag_offset.unwrap_or(thumb_height * 0.5)
+        } else {
+            thumb_height * 0.5
+        };
+        let ratio = if thumb_travel <= f32::EPSILON {
+            0.0
+        } else {
+            ((pointer.y - grab_offset - scrollbar_rect.top()) / thumb_travel).clamp(0.0, 1.0)
+        };
+        top_row = (ratio as f64 * max_top_row as f64).round() as usize;
+    }
+    if scrollbar_response.drag_stopped() {
+        tab.search_scroll_drag_offset = None;
+    }
+    tab.search_top_row = top_row as u64;
+    let visible = top_row..top_row.saturating_add(visible_row_capacity).min(total_rows);
     let mut selected_hit = None::<(String, SearchHit)>;
     let mut read_error = None;
     let mut toggle_session = None;
@@ -5056,101 +5112,129 @@ fn show_search_results(
     let mut select_result_row = None;
     let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
-    scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
-        // The vertical bar occupies part of the outer width. Use the inner
-        // viewport width so rows never extend underneath it.
-        let search_viewport_width = ui.available_width();
-        // `show_rows` requires the callback to add exactly one row for every
-        // index in `visible`. Rendering by session intersections can violate
-        // that contract when the scroll offset changes or a search is still
-        // publishing hits, leaving the whole viewport unpainted.
-        let mut row = visible.start as u64;
-        let visible_end = visible.end as u64;
-        while row < visible_end {
-            let Some(layout) = layouts
-                .iter()
-                .find(|layout| layout.header_row <= row && row < layout.end_row)
-                .copied()
-            else {
-                ui.allocate_exact_size(
-                    egui::vec2(search_viewport_width.max(1.0), SEARCH_RESULT_ROW_HEIGHT),
-                    Sense::hover(),
-                );
-                row = row.saturating_add(1);
-                continue;
-            };
-            let session = &mut tab.search_sessions[layout.session_index];
-            if row == layout.header_row {
-                let is_compare_left = compare_left.is_some_and(|source| {
-                    source.key.path == tab.path && source.key.session_id == session.id
-                });
-                let action = show_search_session_header(
-                    ui,
-                    session,
-                    active_session_id == Some(session.id),
-                    is_compare_left,
-                );
-                if action.toggle {
-                    toggle_session = Some(session.id);
-                }
-                if action.remove {
-                    remove_session = Some(session.id);
-                }
-                if action.compare {
-                    compare_session = Some(session.id);
-                }
-                row = row.saturating_add(1);
-                continue;
-            }
-
-            let first_hit = row.saturating_sub(layout.hits_start);
-            let segment_end = visible_end.min(layout.end_row);
-            let requested = segment_end.saturating_sub(row) as usize;
-            let hits = match session.store.read_page(first_hit, requested) {
-                Ok(hits) => hits,
-                Err(error) => {
-                    read_error = Some(error.to_string());
-                    Vec::new()
-                }
-            };
-            let mut preview_cache = session
-                .preview_cache
-                .lock()
-                .expect("search preview cache poisoned");
-            cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
-            for relative in 0..requested {
-                let hit_index = first_hit + relative as u64;
-                let Some(hit) = hits.get(relative).copied() else {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(Layout::top_down(Align::Min)),
+        |ui| {
+            ui.set_clip_rect(content_rect);
+            let search_viewport_width = content_rect.width().max(1.0);
+            let mut row = visible.start as u64;
+            let visible_end = visible.end as u64;
+            while row < visible_end {
+                let Some(layout) = layouts
+                    .iter()
+                    .find(|layout| layout.header_row <= row && row < layout.end_row)
+                    .copied()
+                else {
                     ui.allocate_exact_size(
                         egui::vec2(search_viewport_width.max(1.0), SEARCH_RESULT_ROW_HEIGHT),
                         Sense::hover(),
                     );
+                    row = row.saturating_add(1);
                     continue;
                 };
-                let preview = preview_cache
-                    .get(&hit_index)
-                    .expect("visible search preview was cached");
-                let is_selected =
-                    search_select_all || selected_search_hit == Some((session.id, hit_index));
-                let action = show_search_result_row(
-                    ui,
-                    session.id,
-                    hit_index,
-                    preview,
-                    is_selected,
-                    search_viewport_width,
-                );
-                if action.activate {
-                    selected_hit = Some((session.query.clone(), hit));
+                let session = &mut tab.search_sessions[layout.session_index];
+                if row == layout.header_row {
+                    let is_compare_left = compare_left.is_some_and(|source| {
+                        source.key.path == tab.path && source.key.session_id == session.id
+                    });
+                    let action = show_search_session_header(
+                        ui,
+                        session,
+                        active_session_id == Some(session.id),
+                        is_compare_left,
+                    );
+                    if action.toggle {
+                        toggle_session = Some(session.id);
+                    }
+                    if action.remove {
+                        remove_session = Some(session.id);
+                    }
+                    if action.compare {
+                        compare_session = Some(session.id);
+                    }
+                    row = row.saturating_add(1);
+                    continue;
                 }
-                if action.select_line {
-                    select_result_row = Some((session.id, hit_index));
+
+                let first_hit = row.saturating_sub(layout.hits_start);
+                let segment_end = visible_end.min(layout.end_row);
+                let requested = segment_end.saturating_sub(row) as usize;
+                let hits = match session.store.read_page(first_hit, requested) {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        Vec::new()
+                    }
+                };
+                let mut preview_cache = session
+                    .preview_cache
+                    .lock()
+                    .expect("search preview cache poisoned");
+                cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
+                for relative in 0..requested {
+                    let hit_index = first_hit + relative as u64;
+                    let Some(hit) = hits.get(relative).copied() else {
+                        ui.allocate_exact_size(
+                            egui::vec2(search_viewport_width.max(1.0), SEARCH_RESULT_ROW_HEIGHT),
+                            Sense::hover(),
+                        );
+                        continue;
+                    };
+                    let preview = preview_cache
+                        .get(&hit_index)
+                        .expect("visible search preview was cached");
+                    let is_selected =
+                        search_select_all || selected_search_hit == Some((session.id, hit_index));
+                    let action = show_search_result_row(
+                        ui,
+                        session.id,
+                        hit_index,
+                        preview,
+                        is_selected,
+                        search_viewport_width,
+                    );
+                    if action.activate {
+                        selected_hit = Some((session.query.clone(), hit));
+                    }
+                    if action.select_line {
+                        select_result_row = Some((session.id, hit_index));
+                    }
+                    began_text_selection |= action.begin_text_selection;
                 }
-                began_text_selection |= action.begin_text_selection;
+                row = segment_end;
             }
-            row = segment_end;
-        }
-    });
+        },
+    );
+
+    let final_ratio = if max_top_row == 0 {
+        0.0
+    } else {
+        top_row as f32 / max_top_row as f32
+    };
+    let thumb = egui::Rect::from_min_size(
+        egui::pos2(
+            scrollbar_rect.left() + 2.0,
+            scrollbar_rect.top() + thumb_travel * final_ratio,
+        ),
+        egui::vec2((scrollbar_rect.width() - 4.0).max(1.0), thumb_height),
+    );
+    ui.painter()
+        .rect_filled(scrollbar_rect, 0.0, Color32::from_rgb(37, 37, 38));
+    ui.painter().line_segment(
+        [scrollbar_rect.left_top(), scrollbar_rect.left_bottom()],
+        egui::Stroke::new(1.0, theme::BORDER),
+    );
+    ui.painter().rect_filled(
+        thumb,
+        2.0,
+        if scrollbar_response.hovered() || scrollbar_response.dragged() {
+            Color32::from_rgb(117, 117, 117)
+        } else {
+            Color32::from_rgb(82, 82, 82)
+        },
+    );
 
     if let Some(session_id) = toggle_session
         && let Some(session) = tab
@@ -7116,26 +7200,101 @@ mod tests {
     }
 
     #[test]
-    fn search_scroll_offset_is_clamped_after_result_content_shrinks() {
+    fn search_result_viewport_calculates_capacity_and_tail_row_without_pixel_offsets() {
+        let visible_rows = search_result_visible_row_capacity(900.0);
+        assert_eq!(visible_rows, 25);
         assert_eq!(
-            search_results_max_scroll_offset(100, SEARCH_RESULT_ROW_HEIGHT, 280.0),
-            3_320.0
+            search_result_max_top_row(5_352_910, visible_rows),
+            5_352_885
         );
-        assert_eq!(
-            clamp_search_scroll_offset(3_320.0, 2, SEARCH_RESULT_ROW_HEIGHT, 280.0),
-            0.0
-        );
-        assert_eq!(
-            clamp_search_scroll_offset(900.0, 20, SEARCH_RESULT_ROW_HEIGHT, 280.0),
-            440.0
-        );
+        assert_eq!(search_result_max_top_row(10, visible_rows), 0);
     }
 
     #[test]
-    fn search_scroll_offset_never_moves_before_the_first_row() {
-        assert_eq!(
-            clamp_search_scroll_offset(-80.0, 100, SEARCH_RESULT_ROW_HEIGHT, 280.0),
-            0.0
+    fn search_result_scrollbar_thumb_has_a_visible_minimum() {
+        assert_eq!(search_result_thumb_height(900.0, 25, 10), 900.0);
+        assert_eq!(search_result_thumb_height(900.0, 25, 100), 225.0);
+        assert_eq!(search_result_thumb_height(900.0, 25, 5_352_910), 18.0);
+    }
+
+    #[test]
+    fn dragging_search_scrollbar_renders_the_target_result_page() {
+        const HIT_COUNT: usize = 100_000;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all("needle\n".repeat(HIT_COUNT).as_bytes())
+            .unwrap();
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let store = Arc::new(SearchHitStore::create().unwrap());
+        let cancelled = AtomicBool::new(false);
+        let result = view
+            .document
+            .search_literal_all(
+                b"needle",
+                SearchAllOptions::default(),
+                &store,
+                &cancelled,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result.hit_count, HIT_COUNT as u64);
+        let preview_cache = Arc::new(Mutex::new(HashMap::new()));
+        view.search_sessions.push(SearchSession {
+            id: 1,
+            query: "needle".into(),
+            store,
+            progress: SearchAllProgress {
+                scanned_bytes: result.scanned_bytes,
+                total_bytes: result.search_bytes,
+                hit_count: result.hit_count,
+            },
+            result: Some(result),
+            error: None,
+            expanded: true,
+            preview_cache: Arc::clone(&preview_cache),
+        });
+        let context = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 900.0));
+        let mut run_frame = |events| {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    show_search_results(ui, &mut view, None);
+                },
+            );
+        };
+        run_frame(Vec::new());
+        preview_cache.lock().unwrap().clear();
+        let thumb_pos = egui::pos2(994.0, 30.0);
+        run_frame(vec![
+            egui::Event::PointerMoved(thumb_pos),
+            egui::Event::PointerButton {
+                pos: thumb_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        run_frame(vec![egui::Event::PointerMoved(egui::pos2(994.0, 450.0))]);
+        run_frame(vec![egui::Event::PointerButton {
+            pos: egui::pos2(994.0, 450.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        let cache = preview_cache.lock().unwrap();
+        let top_row = view.search_top_row;
+        assert!((40_000..60_000).contains(&top_row));
+        assert!(!cache.is_empty());
+        assert!(
+            cache
+                .keys()
+                .any(|index| index.abs_diff(top_row.saturating_sub(1)) < 100)
         );
     }
 
