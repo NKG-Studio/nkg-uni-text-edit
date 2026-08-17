@@ -5015,14 +5015,27 @@ fn show_search_results(
     let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
     scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
-        let visible_start = visible.start as u64;
+        // `show_rows` requires the callback to add exactly one row for every
+        // index in `visible`. Rendering by session intersections can violate
+        // that contract when the scroll offset changes or a search is still
+        // publishing hits, leaving the whole viewport unpainted.
+        let mut row = visible.start as u64;
         let visible_end = visible.end as u64;
-        for layout in &layouts {
-            if layout.end_row <= visible_start || layout.header_row >= visible_end {
+        while row < visible_end {
+            let Some(layout) = layouts
+                .iter()
+                .find(|layout| layout.header_row <= row && row < layout.end_row)
+                .copied()
+            else {
+                ui.allocate_exact_size(
+                    egui::vec2(search_viewport_width.max(1.0), SEARCH_RESULT_ROW_HEIGHT),
+                    Sense::hover(),
+                );
+                row = row.saturating_add(1);
                 continue;
-            }
+            };
             let session = &mut tab.search_sessions[layout.session_index];
-            if visible_start <= layout.header_row && layout.header_row < visible_end {
+            if row == layout.header_row {
                 let is_compare_left = compare_left.is_some_and(|source| {
                     source.key.path == tab.path && source.key.session_id == session.id
                 });
@@ -5041,23 +5054,18 @@ fn show_search_results(
                 if action.compare {
                     compare_session = Some(session.id);
                 }
-            }
-            if !session.expanded {
+                row = row.saturating_add(1);
                 continue;
             }
 
-            let first_visible_hit_row = visible_start.max(layout.hits_start);
-            let end_visible_hit_row = visible_end.min(layout.end_row);
-            if first_visible_hit_row >= end_visible_hit_row {
-                continue;
-            }
-            let first_hit = first_visible_hit_row.saturating_sub(layout.hits_start);
-            let hit_count = (end_visible_hit_row - first_visible_hit_row) as usize;
-            let hits = match session.store.read_page(first_hit, hit_count) {
+            let first_hit = row.saturating_sub(layout.hits_start);
+            let segment_end = visible_end.min(layout.end_row);
+            let requested = segment_end.saturating_sub(row) as usize;
+            let hits = match session.store.read_page(first_hit, requested) {
                 Ok(hits) => hits,
                 Err(error) => {
                     read_error = Some(error.to_string());
-                    continue;
+                    Vec::new()
                 }
             };
             let mut preview_cache = session
@@ -5065,8 +5073,15 @@ fn show_search_results(
                 .lock()
                 .expect("search preview cache poisoned");
             cache_search_previews(&mut preview_cache, &document, first_hit, &hits);
-            for (relative, hit) in hits.into_iter().enumerate() {
+            for relative in 0..requested {
                 let hit_index = first_hit + relative as u64;
+                let Some(hit) = hits.get(relative).copied() else {
+                    ui.allocate_exact_size(
+                        egui::vec2(search_viewport_width.max(1.0), SEARCH_RESULT_ROW_HEIGHT),
+                        Sense::hover(),
+                    );
+                    continue;
+                };
                 let preview = preview_cache
                     .get(&hit_index)
                     .expect("visible search preview was cached");
@@ -5088,6 +5103,7 @@ fn show_search_results(
                 }
                 began_text_selection |= action.begin_text_selection;
             }
+            row = segment_end;
         }
     });
 
