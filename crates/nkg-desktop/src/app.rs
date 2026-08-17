@@ -7,7 +7,8 @@ use crate::{
 };
 use eframe::egui::{
     self, Align, Color32, FontId, Key, Layout, RichText, ScrollArea, Sense, TextFormat, TextStyle,
-    containers::scroll_area::ScrollBarVisibility, text::LayoutJob,
+    containers::scroll_area::{ScrollBarVisibility, State as ScrollAreaState},
+    text::LayoutJob,
     text_selection::LabelSelectionState,
 };
 use nkg_text_engine::{
@@ -652,6 +653,26 @@ fn search_session_rows(sessions: &[SearchSession]) -> (Vec<SearchSessionRows>, u
         next_row = end_row;
     }
     (layouts, next_row)
+}
+
+fn search_results_max_scroll_offset(
+    total_rows: usize,
+    row_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    (total_rows as f32 * row_height - viewport_height.max(0.0)).max(0.0)
+}
+
+fn clamp_search_scroll_offset(
+    offset: f32,
+    total_rows: usize,
+    row_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    offset.clamp(
+        0.0,
+        search_results_max_scroll_offset(total_rows, row_height, viewport_height),
+    )
 }
 
 struct DocumentView {
@@ -4992,14 +5013,39 @@ fn show_search_results(
     let total_rows = usize::try_from(total_rows_u64).unwrap_or(usize::MAX);
     let active_session_id = tab.search_task.as_ref().map(|task| task.session_id);
     let document = Arc::clone(&tab.document);
-    let search_viewport_width = ui.available_width();
     let search_select_all = tab.search_select_all;
     let selected_search_hit = tab.selected_search_hit;
+    let viewport_height = ui.available_height();
+    let scroll_id = ui.make_persistent_id(("search_sessions", &tab.path));
+    let requested_scroll_offset = tab.search_scroll_offset.take().map(|offset| {
+        clamp_search_scroll_offset(
+            offset,
+            total_rows,
+            SEARCH_RESULT_ROW_HEIGHT,
+            viewport_height,
+        )
+    });
+    if requested_scroll_offset.is_none()
+        && let Some(mut state) = ScrollAreaState::load(ui.ctx(), scroll_id)
+    {
+        let clamped = clamp_search_scroll_offset(
+            state.offset.y,
+            total_rows,
+            SEARCH_RESULT_ROW_HEIGHT,
+            viewport_height,
+        );
+        if clamped != state.offset.y {
+            state.offset.y = clamped;
+            state.store(ui.ctx(), scroll_id);
+            ui.ctx().request_repaint();
+        }
+    }
     let mut scroll_area = ScrollArea::vertical()
         .id_salt(("search_sessions", &tab.path))
         .auto_shrink([false, false])
+        .content_margin(0.0)
         .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible);
-    if let Some(offset) = tab.search_scroll_offset.take() {
+    if let Some(offset) = requested_scroll_offset {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
     let mut selected_hit = None::<(String, SearchHit)>;
@@ -5011,6 +5057,9 @@ fn show_search_results(
     let mut began_text_selection = false;
     ui.spacing_mut().item_spacing.y = 0.0;
     scroll_area.show_rows(ui, SEARCH_RESULT_ROW_HEIGHT, total_rows, |ui, visible| {
+        // The vertical bar occupies part of the outer width. Use the inner
+        // viewport width so rows never extend underneath it.
+        let search_viewport_width = ui.available_width();
         // `show_rows` requires the callback to add exactly one row for every
         // index in `visible`. Rendering by session intersections can violate
         // that contract when the scroll offset changes or a search is still
@@ -7064,6 +7113,30 @@ mod tests {
         assert_eq!(search_session_rows(&sessions).1, 4);
         sessions[0].expanded = false;
         assert_eq!(search_session_rows(&sessions).1, 1);
+    }
+
+    #[test]
+    fn search_scroll_offset_is_clamped_after_result_content_shrinks() {
+        assert_eq!(
+            search_results_max_scroll_offset(100, SEARCH_RESULT_ROW_HEIGHT, 280.0),
+            3_320.0
+        );
+        assert_eq!(
+            clamp_search_scroll_offset(3_320.0, 2, SEARCH_RESULT_ROW_HEIGHT, 280.0),
+            0.0
+        );
+        assert_eq!(
+            clamp_search_scroll_offset(900.0, 20, SEARCH_RESULT_ROW_HEIGHT, 280.0),
+            440.0
+        );
+    }
+
+    #[test]
+    fn search_scroll_offset_never_moves_before_the_first_row() {
+        assert_eq!(
+            clamp_search_scroll_offset(-80.0, 100, SEARCH_RESULT_ROW_HEIGHT, 280.0),
+            0.0
+        );
     }
 
     #[test]
