@@ -63,6 +63,7 @@ const HOME_SUBTITLE_SIZE: f32 = 16.0;
 const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
+const BUILD_ID: &str = "20260817-scroll-v2";
 const STRUCTURE_TREE_PAGE_SIZE: usize = 1_000;
 const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -4123,6 +4124,8 @@ impl NkgApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let index = tab.document.index_status();
                             ui.label(index_label(index));
+                            ui.separator();
+                            ui.label(BUILD_ID);
                             ui.separator();
                             ui.label(format!(
                                 "{} · {}",
