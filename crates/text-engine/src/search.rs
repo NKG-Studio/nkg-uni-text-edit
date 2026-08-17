@@ -166,10 +166,11 @@ impl SearchHitStore {
                 source,
             })?;
         let path = temporary.path().to_path_buf();
-        let reader = temporary
-            .as_file()
-            .try_clone()
-            .map_err(|source| EngineError::FileIo { path, source })?;
+        // Open a separate file handle instead of cloning the writer. On
+        // Windows, cloned handles share their file cursor; `seek_read` from
+        // the UI would then move the writer cursor and make later batches
+        // overwrite earlier hit records.
+        let reader = File::open(&path).map_err(|source| EngineError::FileIo { path, source })?;
         Ok(Self {
             writer: Mutex::new(SearchHitWriter {
                 temporary,

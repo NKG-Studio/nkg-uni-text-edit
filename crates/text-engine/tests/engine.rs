@@ -225,6 +225,37 @@ fn search_all_spools_every_hit_and_reads_pages() {
 }
 
 #[test]
+fn search_hit_pages_remain_complete_when_read_during_spooling() {
+    let source = vec![b'a'; 1024];
+    let file = temp_text(&source);
+    let document = TextDocument::open(file.path()).unwrap();
+    let store = SearchHitStore::create().unwrap();
+    let cancel = AtomicBool::new(false);
+    let result = document
+        .search_literal_all(
+            b"a",
+            SearchAllOptions {
+                chunk_bytes: 32,
+                ..Default::default()
+            },
+            &store,
+            &cancel,
+            |_| {
+                let first = store.read_page(0, 1).unwrap();
+                assert_eq!(first.first().map(|hit| hit.byte_start), Some(0));
+            },
+        )
+        .unwrap();
+
+    assert_eq!(result.hit_count, source.len() as u64);
+    let tail = store.read_page(source.len() as u64 - 2, 2).unwrap();
+    assert_eq!(
+        tail.iter().map(|hit| hit.byte_start).collect::<Vec<_>>(),
+        vec![1022, 1023]
+    );
+}
+
+#[test]
 fn search_hit_store_can_only_be_claimed_once() {
     let file = temp_text(b"aaaa");
     let document = TextDocument::open(file.path()).unwrap();
