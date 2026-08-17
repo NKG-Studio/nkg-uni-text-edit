@@ -4997,7 +4997,12 @@ fn show_search_results(
     let selected_search_hit = tab.selected_search_hit;
     let mut scroll_area = ScrollArea::both()
         .id_salt(("search_sessions", &tab.path))
-        .auto_shrink([false, false]);
+        .auto_shrink([false, false])
+        // Keep the viewport dimensions stable while dragging. With conditional
+        // bars, showing/hiding the horizontal bar changes the vertical viewport
+        // after `show_rows` has selected its range, which can leave the tail
+        // frame painted outside the clipped area.
+        .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible);
     if let Some(offset) = tab.search_scroll_offset.take() {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
