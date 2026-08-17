@@ -45,7 +45,7 @@ const TAB_LABEL_HORIZONTAL_PADDING: f32 = 4.0;
 const TAB_LABEL_HEIGHT: f32 = 24.0;
 const TAB_CLOSE_SIZE: f32 = 20.0;
 const TAB_CONTENT_GAP: f32 = 6.0;
-const SEARCH_RESULT_ROW_HEIGHT: f32 = 22.0;
+const SEARCH_RESULT_ROW_HEIGHT: f32 = 36.0;
 const SEARCH_COMPARISON_ROW_HEIGHT: f32 = 42.0;
 const SEARCH_COMPARISON_HEADER_HEIGHT: f32 = 48.0;
 const SEARCH_COMPARISON_DIVIDER_WIDTH: f32 = 1.0;
@@ -4901,7 +4901,7 @@ fn show_search_comparison_cell(
                 .clicked()
                 && hit.is_some();
             ui.add(
-                egui::Label::new(search_preview_layout(preview, theme::TEXT))
+                egui::Label::new(search_preview_layout(preview, theme::TEXT, inner.width()))
                     .truncate()
                     .selectable(true),
             )
@@ -4995,13 +4995,9 @@ fn show_search_results(
     let search_viewport_width = ui.available_width();
     let search_select_all = tab.search_select_all;
     let selected_search_hit = tab.selected_search_hit;
-    let mut scroll_area = ScrollArea::both()
+    let mut scroll_area = ScrollArea::vertical()
         .id_salt(("search_sessions", &tab.path))
         .auto_shrink([false, false])
-        // Keep the viewport dimensions stable while dragging. With conditional
-        // bars, showing/hiding the horizontal bar changes the vertical viewport
-        // after `show_rows` has selected its range, which can leave the tail
-        // frame painted outside the clipped area.
         .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible);
     if let Some(offset) = tab.search_scroll_offset.take() {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
@@ -5381,11 +5377,11 @@ fn show_search_result_row(
     } else {
         theme::MUTED
     };
-    let preview_job = search_preview_layout(preview, text_color);
+    let preview_width =
+        (viewport_width - SEARCH_RESULT_INDEX_WIDTH - SEARCH_RESULT_LINE_WIDTH - 12.0).max(1.0);
+    let preview_job = search_preview_layout(preview, text_color, preview_width);
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(preview_job));
-    let minimum_width =
-        SEARCH_RESULT_INDEX_WIDTH + SEARCH_RESULT_LINE_WIDTH + galley.size().x + 12.0;
-    let row_width = viewport_width.max(minimum_width).max(1.0);
+    let row_width = viewport_width.max(1.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(row_width, SEARCH_RESULT_ROW_HEIGHT),
         Sense::hover(),
@@ -5463,7 +5459,11 @@ fn show_search_result_row(
     }
 }
 
-fn search_preview_layout(preview: &SearchPreview, text_color: Color32) -> LayoutJob {
+fn search_preview_layout(
+    preview: &SearchPreview,
+    text_color: Color32,
+    max_width: f32,
+) -> LayoutJob {
     let normal = TextFormat {
         font_id: FontId::monospace(13.0),
         color: text_color,
@@ -5476,7 +5476,8 @@ fn search_preview_layout(preview: &SearchPreview, text_color: Color32) -> Layout
         ..Default::default()
     };
     let mut job = LayoutJob::default();
-    job.wrap.max_width = f32::INFINITY;
+    job.wrap.max_width = max_width.max(1.0);
+    job.wrap.max_rows = 2;
     if let Some(range) = &preview.match_range
         && preview.text.is_char_boundary(range.start)
         && preview.text.is_char_boundary(range.end)
