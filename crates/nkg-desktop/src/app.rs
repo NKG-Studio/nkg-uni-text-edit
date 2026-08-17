@@ -45,7 +45,7 @@ const TAB_LABEL_HORIZONTAL_PADDING: f32 = 4.0;
 const TAB_LABEL_HEIGHT: f32 = 24.0;
 const TAB_CLOSE_SIZE: f32 = 20.0;
 const TAB_CONTENT_GAP: f32 = 6.0;
-const SEARCH_RESULT_ROW_HEIGHT: f32 = 36.0;
+const SEARCH_RESULT_ROW_HEIGHT: f32 = 24.0;
 const SEARCH_RESULT_SCROLLBAR_WIDTH: f32 = 14.0;
 const SEARCH_RESULT_MIN_THUMB_HEIGHT: f32 = 18.0;
 const SEARCH_COMPARISON_ROW_HEIGHT: f32 = 42.0;
@@ -63,7 +63,7 @@ const HOME_SUBTITLE_SIZE: f32 = 16.0;
 const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
-const BUILD_ID: &str = "20260817-hitstore-v3";
+const BUILD_ID: &str = "20260817-wheel-v4";
 const STRUCTURE_TREE_PAGE_SIZE: usize = 1_000;
 const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -5024,7 +5024,7 @@ fn show_search_results(
         ui.available_width().max(1.0),
         ui.available_height().max(1.0),
     );
-    let (viewport_rect, viewport_response) = ui.allocate_exact_size(viewport_size, Sense::hover());
+    let (viewport_rect, _) = ui.allocate_exact_size(viewport_size, Sense::hover());
     let scrollbar_width = SEARCH_RESULT_SCROLLBAR_WIDTH.min(viewport_rect.width());
     let content_rect = egui::Rect::from_min_max(
         viewport_rect.left_top(),
@@ -5043,7 +5043,13 @@ fn show_search_results(
         .unwrap_or(usize::MAX)
         .min(max_top_row);
 
-    if viewport_response.hovered() {
+    let pointer_in_viewport = ui.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|pointer| viewport_rect.contains(pointer))
+    });
+    if pointer_in_viewport {
         let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll_delta.abs() > f32::EPSILON {
             let rows = (scroll_delta.abs() / SEARCH_RESULT_ROW_HEIGHT)
@@ -5613,7 +5619,8 @@ fn search_preview_layout(
     };
     let mut job = LayoutJob::default();
     job.wrap.max_width = max_width.max(1.0);
-    job.wrap.max_rows = 2;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
     if let Some(range) = &preview.match_range
         && preview.text.is_char_boundary(range.start)
         && preview.text.is_char_boundary(range.end)
@@ -7205,10 +7212,10 @@ mod tests {
     #[test]
     fn search_result_viewport_calculates_capacity_and_tail_row_without_pixel_offsets() {
         let visible_rows = search_result_visible_row_capacity(900.0);
-        assert_eq!(visible_rows, 25);
+        assert_eq!(visible_rows, 38);
         assert_eq!(
             search_result_max_top_row(5_352_910, visible_rows),
-            5_352_885
+            5_352_872
         );
         assert_eq!(search_result_max_top_row(10, visible_rows), 0);
     }
@@ -7218,6 +7225,25 @@ mod tests {
         assert_eq!(search_result_thumb_height(900.0, 25, 10), 900.0);
         assert_eq!(search_result_thumb_height(900.0, 25, 100), 225.0);
         assert_eq!(search_result_thumb_height(900.0, 25, 5_352_910), 18.0);
+    }
+
+    #[test]
+    fn search_preview_is_single_line_and_elides_overflow() {
+        let preview = SearchPreview {
+            line_number: None,
+            text: Arc::from("a very long search preview that cannot fit in the available width"),
+            match_range: None,
+            byte_start: 0,
+        };
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let job = search_preview_layout(&preview, theme::TEXT, 80.0);
+            assert_eq!(job.wrap.max_rows, 1);
+            assert!(job.wrap.break_anywhere);
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            assert_eq!(galley.rows.len(), 1);
+            assert!(galley.elided);
+        });
     }
 
     #[test]
@@ -7269,6 +7295,7 @@ mod tests {
                     show_search_results(ui, &mut view, None);
                 },
             );
+            view.search_top_row
         };
         run_frame(Vec::new());
         preview_cache.lock().unwrap().clear();
@@ -7283,16 +7310,26 @@ mod tests {
             },
         ]);
         run_frame(vec![egui::Event::PointerMoved(egui::pos2(994.0, 450.0))]);
-        run_frame(vec![egui::Event::PointerButton {
+        let row_after_drag = run_frame(vec![egui::Event::PointerButton {
             pos: egui::pos2(994.0, 450.0),
             button: egui::PointerButton::Primary,
             pressed: false,
             modifiers: egui::Modifiers::NONE,
         }]);
+        let row_after_wheel = run_frame(vec![
+            egui::Event::PointerMoved(egui::pos2(500.0, 300.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
 
         let cache = preview_cache.lock().unwrap();
         let top_row = view.search_top_row;
         assert!((40_000..60_000).contains(&top_row));
+        assert!(row_after_wheel > row_after_drag);
         assert!(!cache.is_empty());
         assert!(
             cache
