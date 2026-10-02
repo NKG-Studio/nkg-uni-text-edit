@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="crates/nkg-desktop/assets/nkg-icon-master.png" alt="NKG Uni Text Edit" width="360" />
+</p>
+
 # NKG Uni Text Edit
 
 面向超大文本文件的桌面阅读、搜索、高亮与对比工具。目标是在普通 64 位桌面环境中处理
