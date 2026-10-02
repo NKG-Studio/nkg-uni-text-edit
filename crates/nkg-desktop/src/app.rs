@@ -63,7 +63,7 @@ const HOME_SUBTITLE_SIZE: f32 = 16.0;
 const HOME_ACTION_TEXT_SIZE: f32 = 16.0;
 const HOME_ACTION_SIZE: egui::Vec2 = egui::vec2(190.0, 40.0);
 const HOME_HINT_SIZE: f32 = 14.0;
-const BUILD_ID: &str = "20260817-wheel-v4";
+const BUILD_ID: &str = "20260824-live-refresh-v5";
 const STRUCTURE_TREE_PAGE_SIZE: usize = 1_000;
 const MAX_STRUCTURED_DIFF_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -869,6 +869,35 @@ impl DocumentView {
         !self.edits.is_empty()
     }
 
+    fn refresh_source_if_changed(&mut self) -> Result<bool, String> {
+        match self.document.source().metadata_is_unchanged() {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if self.dirty() {
+            return Err(
+                "文件已被外部修改，但当前视图还有未保存编辑；请先保存副本后再重新打开".into(),
+            );
+        }
+        if self.save_task.is_some() {
+            return Err("文件已被外部修改，但当前仍在保存副本；请等待保存完成后重试".into());
+        }
+
+        let mut refreshed = Self::open(self.path.clone())?;
+        refreshed.query = std::mem::take(&mut self.query);
+        refreshed.ignore_ascii_case = self.ignore_ascii_case;
+        refreshed.json_filter = std::mem::take(&mut self.json_filter);
+        refreshed.xml_filter = std::mem::take(&mut self.xml_filter);
+        refreshed.edit_mode = self.edit_mode;
+        refreshed.editor_visible_line_capacity = self.editor_visible_line_capacity;
+        refreshed.editor_row_height = self.editor_row_height;
+        refreshed.editor_scroll_revision = self.editor_scroll_revision.wrapping_add(1);
+        refreshed.next_search_session_id = self.next_search_session_id;
+        *self = refreshed;
+        Ok(true)
+    }
+
     fn background_active(&self) -> bool {
         self.search_task.is_some()
             || self.save_task.is_some()
@@ -1330,6 +1359,13 @@ impl DocumentView {
     }
 
     fn load_overview_position(&mut self, ratio: f64) {
+        let source_refreshed = match self.refresh_source_if_changed() {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.status_message = format!("无法预览文件位置：{error}");
+                return;
+            }
+        };
         let file_len = self.document.len();
         if file_len == 0 {
             self.load_offset(0);
@@ -1337,6 +1373,9 @@ impl DocumentView {
         }
         if ratio < 1.0 {
             self.load_offset((ratio.clamp(0.0, 1.0) * file_len as f64) as u64);
+            if source_refreshed && self.status_message == "已跳转" {
+                self.status_message = "检测到文件已被外部修改，已刷新并跳转".into();
+            }
             return;
         }
 
@@ -1362,7 +1401,11 @@ impl DocumentView {
                 self.selected_json_node = None;
                 self.selected_xml_node = None;
                 self.refresh_highlights();
-                self.status_message = "已到达文件末尾".into();
+                self.status_message = if source_refreshed {
+                    "检测到文件已被外部修改，已刷新并到达文件末尾".into()
+                } else {
+                    "已到达文件末尾".into()
+                };
             }
             Err(error) => self.status_message = error.to_string(),
         }
@@ -1438,7 +1481,8 @@ impl DocumentView {
         }
     }
 
-    fn load_centered_offset(&mut self, offset: u64) {
+    fn load_centered_offset(&mut self, offset: u64) -> Result<bool, String> {
+        let source_refreshed = self.refresh_source_if_changed()?;
         match read_centered_window(&self.document, offset) {
             Ok(window) => {
                 let offset = offset.min(self.document.len());
@@ -1453,8 +1497,9 @@ impl DocumentView {
                 self.editor_horizontal_drag_offset = None;
                 self.refresh_highlights();
                 self.status_message = "已跳转".into();
+                Ok(source_refreshed)
             }
-            Err(error) => self.status_message = error,
+            Err(error) => Err(error),
         }
     }
 
@@ -1932,7 +1977,13 @@ impl DocumentView {
     fn jump_to_hit(&mut self, hit: SearchHit) {
         self.selected_editor_line = None;
         self.editor_select_all = false;
-        self.load_centered_offset(hit.byte_start);
+        let source_refreshed = match self.load_centered_offset(hit.byte_start) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.status_message = format!("无法跳转搜索命中：{error}");
+                return;
+            }
+        };
         if let Some(line_start) = self
             .window
             .lines
@@ -1942,13 +1993,26 @@ impl DocumentView {
         {
             self.select_editor_line(line_start);
         }
-        self.status_message = format!("搜索命中：{}..{}", hit.byte_start, hit.byte_end);
+        self.status_message = if source_refreshed {
+            format!(
+                "文件已被外部修改，已刷新并跳转到原搜索位置：{}..{}；旧搜索结果已清除",
+                hit.byte_start, hit.byte_end
+            )
+        } else {
+            format!("搜索命中：{}..{}", hit.byte_start, hit.byte_end)
+        };
     }
 
     fn jump_to_json_node(&mut self, node_id: usize, offset: u64, label: &str) {
         self.selected_editor_line = None;
         self.editor_select_all = false;
-        self.load_centered_offset(offset);
+        let source_refreshed = match self.load_centered_offset(offset) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.status_message = format!("无法跳转 JSON 节点 {label}：{error}");
+                return;
+            }
+        };
         if let Some(line_start) = self
             .window
             .lines
@@ -1958,14 +2022,24 @@ impl DocumentView {
         {
             self.select_editor_line(line_start);
         }
-        self.selected_json_node = Some(node_id);
-        self.status_message = format!("已跳转 JSON 节点：{label}");
+        self.selected_json_node = (!source_refreshed).then_some(node_id);
+        self.status_message = if source_refreshed {
+            format!("文件已被外部修改，已刷新并跳转到节点原位置：{label}；结构索引正在重建")
+        } else {
+            format!("已跳转 JSON 节点：{label}")
+        };
     }
 
     fn jump_to_xml_node(&mut self, node_id: usize, offset: u64, label: &str) {
         self.selected_editor_line = None;
         self.editor_select_all = false;
-        self.load_centered_offset(offset);
+        let source_refreshed = match self.load_centered_offset(offset) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.status_message = format!("无法跳转 XML 节点 <{label}>：{error}");
+                return;
+            }
+        };
         if let Some(line_start) = self
             .window
             .lines
@@ -1975,14 +2049,24 @@ impl DocumentView {
         {
             self.select_editor_line(line_start);
         }
-        self.selected_xml_node = Some(node_id);
-        self.status_message = format!("已跳转 XML 节点：<{label}>");
+        self.selected_xml_node = (!source_refreshed).then_some(node_id);
+        self.status_message = if source_refreshed {
+            format!("文件已被外部修改，已刷新并跳转到节点原位置：<{label}>；结构索引正在重建")
+        } else {
+            format!("已跳转 XML 节点：<{label}>")
+        };
     }
 
     fn jump_to_binary_node(&mut self, node_id: usize, offset: u64, label: &str) {
         self.selected_editor_line = None;
         self.editor_select_all = false;
-        self.load_centered_offset(offset);
+        let source_refreshed = match self.load_centered_offset(offset) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.status_message = format!("无法跳转二进制字段 {label}：{error}");
+                return;
+            }
+        };
         if let Some(line_start) = self
             .window
             .lines
@@ -1992,8 +2076,12 @@ impl DocumentView {
         {
             self.select_editor_line(line_start);
         }
-        self.selected_binary_node = Some(node_id);
-        self.status_message = format!("已跳转二进制字段：{label}");
+        self.selected_binary_node = (!source_refreshed).then_some(node_id);
+        self.status_message = if source_refreshed {
+            format!("文件已被外部修改，已刷新并跳转到字段原位置：{label}；请重新载入模板")
+        } else {
+            format!("已跳转二进制字段：{label}")
+        };
     }
 
     fn remove_search_session(&mut self, session_id: u64) {
@@ -7031,6 +7119,69 @@ mod tests {
         );
         assert_eq!(view.selected_json_node, Some(node_id));
         assert_eq!(path, ["$", "data", "[0]", "totalSize"]);
+    }
+
+    #[test]
+    fn json_node_jump_refreshes_a_source_changed_on_disk() {
+        let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        write!(
+            file,
+            "{{\n  \"data\": [\n    {{\n      \"name\": \"x\",\n      \"totalSize\": 42\n    }}\n  ]\n}}"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let outline =
+            scan_json_outline(&view.document, &AtomicBool::new(false), |_, _| {}).unwrap();
+        let node_id = outline
+            .nodes
+            .iter()
+            .enumerate()
+            .position(|(id, _)| outline.label(id) == "totalSize")
+            .unwrap();
+        let offset = outline.nodes[node_id].byte_start;
+        view.json_outline = Some(outline);
+        let original_document = Arc::clone(&view.document);
+
+        writeln!(file).unwrap();
+        file.flush().unwrap();
+        view.jump_to_json_node(node_id, offset, "totalSize");
+
+        assert!(!Arc::ptr_eq(&view.document, &original_document));
+        assert!(view.json_outline.is_none());
+        assert_eq!(view.selected_json_node, None);
+        assert!(view.status_message.contains("文件已被外部修改"));
+        let selected_line = view.selected_editor_line.unwrap();
+        assert!(
+            view.window
+                .lines
+                .iter()
+                .find(|line| line.byte_start == selected_line)
+                .is_some_and(|line| line.text.contains("\"totalSize\""))
+        );
+    }
+
+    #[test]
+    fn overview_navigation_refreshes_a_source_changed_on_disk() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in 0..6_000 {
+            writeln!(file, "line-{line:04}").unwrap();
+        }
+        file.flush().unwrap();
+        let mut view = DocumentView::open(file.path().to_path_buf()).unwrap();
+        let original_document = Arc::clone(&view.document);
+
+        writeln!(file, "line-added-after-open").unwrap();
+        file.flush().unwrap();
+        view.load_overview_position(0.5);
+
+        assert!(!Arc::ptr_eq(&view.document, &original_document));
+        assert_eq!(
+            view.document.len(),
+            file.as_file().metadata().unwrap().len()
+        );
+        assert!(view.requested_offset > 0);
+        assert!(view.status_message.contains("已刷新并跳转"));
     }
 
     #[test]
